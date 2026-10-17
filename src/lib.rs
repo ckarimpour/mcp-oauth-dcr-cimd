@@ -1,0 +1,542 @@
+// Copyright 2026 Salesforce, Inc. All rights reserved.
+
+//! MCP OAuth client registration facade (CIMD + DCR). See docs/spec.md.
+//!
+//! This file only orchestrates PDK state transitions and outbound calls. The OAuth logic lives
+//! in `oauth`, `consent`, `cimd`, `seal` and `uri` as plain, unit-tested functions.
+
+mod cimd;
+mod consent;
+mod generated;
+mod oauth;
+mod seal;
+mod settings;
+mod uri;
+
+#[cfg(test)]
+mod filter_tests;
+
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use anyhow::{anyhow, Result};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use serde_json::Value;
+
+use pdk::cache::{Cache, CacheBuilder};
+use pdk::hl::*;
+use pdk::logger;
+
+use crate::consent::BrowserSecret;
+use crate::generated::config::Config;
+use crate::oauth::{BrowserOutcome, ClientInfo, OAuthError, Route};
+use crate::seal::NONCE_LEN;
+use crate::settings::Settings;
+use crate::uri::Params;
+
+const POLICY_NAME: &str = "mcp-oauth-dcr-cimd";
+
+const MAX_BODY_BYTES: usize = 16 * 1024;
+const CIMD_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+const TOKEN_TIMEOUT: Duration = Duration::from_secs(10);
+const CIMD_CACHE_ID: &str = "cimd-documents";
+const CIMD_CACHE_ENTRIES: usize = 500;
+
+const ACCEPT_HEADER: &str = "accept";
+const ALLOW_HEADER: &str = "allow";
+const AUTHORIZATION_HEADER: &str = "authorization";
+const CACHE_CONTROL_HEADER: &str = "cache-control";
+const CONTENT_LENGTH_HEADER: &str = "content-length";
+const CONTENT_SECURITY_POLICY_HEADER: &str = "content-security-policy";
+const CONTENT_TYPE_HEADER: &str = "content-type";
+const CONTENT_TYPE_OPTIONS_HEADER: &str = "x-content-type-options";
+const COOKIE_HEADER: &str = "cookie";
+const CORS_ALLOW_HEADERS_HEADER: &str = "access-control-allow-headers";
+const CORS_ALLOW_METHODS_HEADER: &str = "access-control-allow-methods";
+const CORS_ALLOW_ORIGIN_HEADER: &str = "access-control-allow-origin";
+const CORS_EXPOSE_HEADERS_HEADER: &str = "access-control-expose-headers";
+const CORS_MAX_AGE_HEADER: &str = "access-control-max-age";
+const FRAME_OPTIONS_HEADER: &str = "x-frame-options";
+const LOCATION_HEADER: &str = "location";
+const REFERRER_POLICY_HEADER: &str = "referrer-policy";
+const SET_COOKIE_HEADER: &str = "set-cookie";
+const WWW_AUTHENTICATE_HEADER: &str = "www-authenticate";
+
+const APPLICATION_JSON: &str = "application/json";
+const FORM_URLENCODED: &str = "application/x-www-form-urlencoded";
+const TEXT_HTML: &str = "text/html; charset=utf-8";
+const TEXT_PLAIN: &str = "text/plain; charset=utf-8";
+const NO_STORE: &str = "no-store";
+/// The consent page holds a live IdP link: never frame it, load nothing, submit nothing.
+const CONSENT_PAGE_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; \
+                                frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
+const CHALLENGE_BODY: &str =
+    r#"{"error":"invalid_token","error_description":"authorization required"}"#;
+
+// ---------------------------------------------------------------------------------------------
+// Filters
+// ---------------------------------------------------------------------------------------------
+
+async fn request_filter(
+    state: RequestState,
+    settings: &Settings,
+    cache: &dyn Cache,
+    client: HttpClient,
+) -> Flow<()> {
+    let headers_state = state.into_headers_state().await;
+    let method = headers_state.method();
+    let path = headers_state.path();
+    let oauth = &settings.oauth;
+
+    match oauth.routes.route(&method, &path) {
+        Route::Other => {
+            if oauth.challenge_unauthenticated
+                && method != "OPTIONS"
+                && headers_state
+                    .handler()
+                    .header(AUTHORIZATION_HEADER)
+                    .is_none()
+            {
+                logger::debug!("No Authorization header: answering with a discovery challenge");
+                return Flow::Break(challenge_response(settings));
+            }
+            Flow::Continue(())
+        }
+        Route::Preflight => Flow::Break(preflight_response()),
+        Route::MethodNotAllowed(allow) => Flow::Break(response(
+            405,
+            vec![(ALLOW_HEADER, allow.to_string())],
+            Vec::new(),
+        )),
+        Route::ProtectedResourceMetadata => Flow::Break(json_response(
+            200,
+            &oauth::protected_resource_metadata(oauth),
+        )),
+        Route::AuthorizationServerMetadata => Flow::Break(json_response(
+            200,
+            &oauth::authorization_server_metadata(oauth),
+        )),
+        Route::Authorize => Flow::Break(authorize(&path, settings, cache, &client).await),
+        Route::Callback => {
+            let cookie = headers_state.handler().header(COOKIE_HEADER);
+            Flow::Break(callback(&path, cookie.as_deref(), settings))
+        }
+        route @ (Route::Register | Route::Token) => {
+            let handler = headers_state.handler();
+            let declared_length = handler
+                .header(CONTENT_LENGTH_HEADER)
+                .and_then(|length| length.trim().parse::<usize>().ok());
+            if declared_length.is_some_and(|length| length > MAX_BODY_BYTES) {
+                return Flow::Break(oauth_error_response(&too_large()));
+            }
+            let authorization = handler.header(AUTHORIZATION_HEADER);
+
+            // Buffer headers and body together so the request is never forwarded upstream.
+            let body_state = headers_state.into_headers_body_state().await;
+            let body = if body_state.contains_body() {
+                body_state.handler().body()
+            } else {
+                Vec::new()
+            };
+            if body.len() > MAX_BODY_BYTES {
+                return Flow::Break(oauth_error_response(&too_large()));
+            }
+
+            if route == Route::Register {
+                Flow::Break(register(&body, settings))
+            } else {
+                Flow::Break(token(&body, authorization.as_deref(), settings, &client).await)
+            }
+        }
+    }
+}
+
+/// Adds `resource_metadata` to 401s from later policies (e.g. JWT Validation) so MCP clients can
+/// discover the authorization server. Headers only: streaming (SSE) bodies are never touched.
+async fn response_filter(state: ResponseState, settings: &Settings) {
+    if !settings.oauth.challenge_unauthenticated {
+        return;
+    }
+    let headers_state = state.into_headers_state().await;
+    if headers_state.status_code() != 401 {
+        return;
+    }
+    let handler = headers_state.handler();
+    let existing = handler.header(WWW_AUTHENTICATE_HEADER);
+    if let Some(challenge) =
+        oauth::challenge_with_metadata(existing.as_deref(), &settings.oauth.prm_url)
+    {
+        handler.set_header(WWW_AUTHENTICATE_HEADER, &challenge);
+        handler.set_header(CORS_EXPOSE_HEADERS_HEADER, WWW_AUTHENTICATE_HEADER);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Endpoint handlers
+// ---------------------------------------------------------------------------------------------
+
+async fn authorize(
+    path: &str,
+    settings: &Settings,
+    cache: &dyn Cache,
+    client: &HttpClient,
+) -> Response {
+    let now = match now_secs() {
+        Some(now) => now,
+        None => return browser_response(BrowserOutcome::BadRequest("internal error".into())),
+    };
+    let params = Params::from_query_of(path);
+    let client_id = match oauth::authorize_client_id(&params) {
+        Ok(client_id) => client_id,
+        Err(message) => return browser_response(BrowserOutcome::BadRequest(message)),
+    };
+    let client_info = match resolve_client(client_id, settings, cache, client, now).await {
+        Ok(client_info) => client_info,
+        Err(message) => {
+            logger::info!("Rejected an authorization request: {}", message);
+            return browser_response(BrowserOutcome::BadRequest(message));
+        }
+    };
+    // Fresh per request; authorize() fails closed if consent is required and these are missing.
+    let browser = match (random_token(6), random_token(16)) {
+        (Some(key), Some(value)) => Some(BrowserSecret { key, value }),
+        _ => None,
+    };
+    browser_response(oauth::authorize(
+        &settings.oauth,
+        &client_info,
+        &params,
+        now,
+        browser.as_ref(),
+    ))
+}
+
+fn callback(path: &str, cookie: Option<&str>, settings: &Settings) -> Response {
+    let (now, nonce) = match (now_secs(), random_nonce()) {
+        (Some(now), Some(nonce)) => (now, nonce),
+        _ => return browser_response(BrowserOutcome::BadRequest("internal error".into())),
+    };
+    let params = Params::from_query_of(path);
+    browser_response(oauth::callback(
+        &settings.oauth,
+        &params,
+        cookie,
+        now,
+        &nonce,
+    ))
+}
+
+fn register(body: &[u8], settings: &Settings) -> Response {
+    let now = match now_secs() {
+        Some(now) => now,
+        None => return oauth_error_response(&oauth::server_error()),
+    };
+    let nonce = random_token(12);
+    match oauth::register(&settings.oauth, body, now, nonce.as_deref()) {
+        Ok(registration) => {
+            logger::info!("Registered a dynamic MCP client");
+            json_response(201, &registration)
+        }
+        Err(err) => {
+            // The description can echo client input (redirect URIs): log only the error code.
+            logger::info!("Rejected a client registration: {}", err.error);
+            oauth_error_response(&err)
+        }
+    }
+}
+
+/// Resolves a client_id to its registered redirect URIs: CIMD clients by fetching (and caching)
+/// their metadata document from a trusted host, DCR clients by opening the sealed client_id.
+async fn resolve_client(
+    client_id: &str,
+    settings: &Settings,
+    cache: &dyn Cache,
+    client: &HttpClient,
+    now: u64,
+) -> Result<ClientInfo, String> {
+    if !cimd::is_cimd_client_id(client_id) {
+        return oauth::open_dcr_client(&settings.oauth, client_id, now);
+    }
+    if !settings.oauth.enable_cimd {
+        return Err("client metadata document clients are not accepted".into());
+    }
+    let target = cimd::validate_client_id_url(client_id)?;
+    let service = settings
+        .cimd_service(&target.origin)
+        .ok_or("the client_id host is not trusted by this server")?;
+
+    let caching = !settings.cimd_cache_ttl.is_zero();
+    if caching {
+        if let Some(cached) = cache.get(client_id) {
+            if let Ok(info) = serde_json::from_slice::<ClientInfo>(&cached) {
+                return Ok(info);
+            }
+        }
+    }
+
+    let response = client
+        .request(service)
+        .path(&target.path_and_query)
+        .headers(vec![(ACCEPT_HEADER, APPLICATION_JSON)])
+        .timeout(CIMD_FETCH_TIMEOUT)
+        .get()
+        .await
+        .map_err(|err| {
+            logger::warn!("Client metadata document fetch failed: {}", err);
+            "the client metadata document could not be fetched".to_string()
+        })?;
+    if response.status_code() != 200 {
+        logger::warn!(
+            "Client metadata document fetch returned HTTP {}",
+            response.status_code()
+        );
+        return Err("the client metadata document could not be fetched".into());
+    }
+    let info = cimd::parse_document(client_id, response.body())?;
+
+    if caching {
+        if let Ok(serialized) = serde_json::to_vec(&info) {
+            if cache.save(client_id, serialized).is_err() {
+                logger::debug!("Could not cache a client metadata document");
+            }
+        }
+    }
+    Ok(info)
+}
+
+async fn token(
+    body: &[u8],
+    authorization: Option<&str>,
+    settings: &Settings,
+    client: &HttpClient,
+) -> Response {
+    let oauth = &settings.oauth;
+    let (now, nonce) = match (now_secs(), random_nonce()) {
+        (Some(now), Some(nonce)) => (now, nonce),
+        _ => return oauth_error_response(&oauth::server_error()),
+    };
+    let request = match oauth::token_request(oauth, body, authorization, now) {
+        Ok(request) => request,
+        Err(err) => {
+            logger::info!("Rejected a token request: {}", err.error);
+            return oauth_error_response(&err);
+        }
+    };
+
+    let mut headers = vec![
+        (CONTENT_TYPE_HEADER, FORM_URLENCODED),
+        (ACCEPT_HEADER, APPLICATION_JSON),
+    ];
+    if let Some(value) = request.authorization.as_deref() {
+        headers.push((AUTHORIZATION_HEADER, value));
+    }
+    let upstream = client
+        .request(&settings.token_service)
+        .headers(headers)
+        .body(request.form.as_bytes())
+        .timeout(TOKEN_TIMEOUT)
+        .post()
+        .await;
+
+    let result = match upstream {
+        Ok(response) => {
+            let status = response.status_code();
+            let result = oauth::token_response(
+                oauth,
+                status,
+                response.body(),
+                &request.client_fingerprint,
+                now,
+                &nonce,
+            );
+            match &result {
+                Err(err) if err.status == 502 => logger::error!(
+                    "IdP token endpoint returned HTTP {}: {}. Check the upstream client settings.",
+                    status,
+                    err.description
+                ),
+                Err(_) => logger::warn!("IdP token endpoint returned HTTP {}", status),
+                Ok(_) => {}
+            }
+            result
+        }
+        Err(err) => {
+            logger::warn!("IdP token endpoint call failed: {}", err);
+            Err(oauth::temporarily_unavailable())
+        }
+    };
+    match result {
+        Ok(token_body) => api_response(200, token_body),
+        Err(err) => oauth_error_response(&err),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------------------------
+
+/// `len` random bytes from the host (WASI random_get), base64url-encoded.
+fn random_token(len: usize) -> Option<String> {
+    let mut bytes = vec![0u8; len];
+    fill_random(&mut bytes).map(|()| URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn random_nonce() -> Option<[u8; NONCE_LEN]> {
+    let mut nonce = [0u8; NONCE_LEN];
+    fill_random(&mut nonce).map(|()| nonce)
+}
+
+fn fill_random(bytes: &mut [u8]) -> Option<()> {
+    match getrandom::getrandom(bytes) {
+        Ok(()) => Some(()),
+        Err(err) => {
+            logger::warn!("No randomness available from the host: {}", err);
+            None
+        }
+    }
+}
+
+fn now_secs() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|elapsed| elapsed.as_secs())
+}
+
+/// Builds an early response with an explicit `content-length`.
+fn response(status: u32, headers: Vec<(&str, String)>, body: Vec<u8>) -> Response {
+    let mut headers: Vec<(String, String)> = headers
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value))
+        .collect();
+    headers.push((CONTENT_LENGTH_HEADER.to_string(), body.len().to_string()));
+    Response::new(status).with_headers(headers).with_body(body)
+}
+
+/// JSON response for the OAuth endpoints: never cached, readable cross-origin.
+fn api_response(status: u32, body: Vec<u8>) -> Response {
+    response(
+        status,
+        vec![
+            (CONTENT_TYPE_HEADER, APPLICATION_JSON.to_string()),
+            (CACHE_CONTROL_HEADER, NO_STORE.to_string()),
+            (CORS_ALLOW_ORIGIN_HEADER, "*".to_string()),
+        ],
+        body,
+    )
+}
+
+fn json_response(status: u32, body: &Value) -> Response {
+    api_response(status, body.to_string().into_bytes())
+}
+
+fn oauth_error_response(err: &OAuthError) -> Response {
+    api_response(err.status, err.body())
+}
+
+fn too_large() -> OAuthError {
+    OAuthError {
+        status: 413,
+        error: "invalid_request",
+        description: "request body is too large".into(),
+    }
+}
+
+fn browser_response(outcome: BrowserOutcome) -> Response {
+    match outcome {
+        BrowserOutcome::Redirect(location) => response(
+            302,
+            vec![
+                (LOCATION_HEADER, location),
+                (CACHE_CONTROL_HEADER, NO_STORE.to_string()),
+            ],
+            Vec::new(),
+        ),
+        BrowserOutcome::Consent(page) => response(
+            200,
+            vec![
+                (CONTENT_TYPE_HEADER, TEXT_HTML.to_string()),
+                (CACHE_CONTROL_HEADER, NO_STORE.to_string()),
+                (SET_COOKIE_HEADER, page.set_cookie),
+                (FRAME_OPTIONS_HEADER, "DENY".to_string()),
+                (CONTENT_SECURITY_POLICY_HEADER, CONSENT_PAGE_CSP.to_string()),
+                (REFERRER_POLICY_HEADER, "no-referrer".to_string()),
+                (CONTENT_TYPE_OPTIONS_HEADER, "nosniff".to_string()),
+            ],
+            page.html.into_bytes(),
+        ),
+        BrowserOutcome::BadRequest(message) => response(
+            400,
+            vec![
+                (CONTENT_TYPE_HEADER, TEXT_PLAIN.to_string()),
+                (CACHE_CONTROL_HEADER, NO_STORE.to_string()),
+            ],
+            format!("Authorization failed: {}\n", message).into_bytes(),
+        ),
+    }
+}
+
+fn challenge_response(settings: &Settings) -> Response {
+    let challenge = oauth::challenge_with_metadata(None, &settings.oauth.prm_url)
+        .unwrap_or_else(|| "Bearer".to_string());
+    response(
+        401,
+        vec![
+            (WWW_AUTHENTICATE_HEADER, challenge),
+            (CONTENT_TYPE_HEADER, APPLICATION_JSON.to_string()),
+            (CORS_ALLOW_ORIGIN_HEADER, "*".to_string()),
+            (
+                CORS_EXPOSE_HEADERS_HEADER,
+                WWW_AUTHENTICATE_HEADER.to_string(),
+            ),
+        ],
+        CHALLENGE_BODY.as_bytes().to_vec(),
+    )
+}
+
+fn preflight_response() -> Response {
+    response(
+        204,
+        vec![
+            (CORS_ALLOW_ORIGIN_HEADER, "*".to_string()),
+            (CORS_ALLOW_METHODS_HEADER, "GET, POST, OPTIONS".to_string()),
+            (
+                CORS_ALLOW_HEADERS_HEADER,
+                "authorization, content-type, mcp-protocol-version".to_string(),
+            ),
+            (CORS_MAX_AGE_HEADER, "600".to_string()),
+        ],
+        Vec::new(),
+    )
+}
+
+// ---------------------------------------------------------------------------------------------
+// Entrypoint
+// ---------------------------------------------------------------------------------------------
+
+#[entrypoint]
+async fn configure(
+    launcher: Launcher,
+    Configuration(bytes): Configuration,
+    cache_builder: CacheBuilder,
+) -> Result<()> {
+    // Never echo the raw configuration: it contains the client secret and signing secret.
+    if bytes.is_empty() {
+        return Err(anyhow!("{}: configuration was empty", POLICY_NAME));
+    }
+    let config: Config = serde_json::from_slice(&bytes)
+        .map_err(|err| anyhow!("{}: failed to parse configuration: {}", POLICY_NAME, err))?;
+    let settings = Settings::from_config(config)
+        .map_err(|err| anyhow!("{}: invalid configuration: {}", POLICY_NAME, err))?;
+
+    let cache = cache_builder
+        .new(CIMD_CACHE_ID.to_string())
+        .max_entries(CIMD_CACHE_ENTRIES)
+        .ttl(settings.cimd_cache_ttl.max(Duration::from_secs(1)))
+        .build();
+
+    let filter = on_request(|state, client| request_filter(state, &settings, &cache, client))
+        .on_response(|state| response_filter(state, &settings));
+    launcher.launch(filter).await?;
+    Ok(())
+}

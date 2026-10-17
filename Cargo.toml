@@ -1,0 +1,43 @@
+# Copyright 2026 Salesforce, Inc. All rights reserved.
+[package]
+name = "mcp_oauth_dcr_cimd"
+version = "1.0.0"
+rust-version = "1.88.0"
+edition = "2018"
+resolver = "2"
+
+[lib]
+crate-type = ["cdylib"]
+
+[package.metadata.anypoint]
+group_id = "8424d173-f285-4795-8432-3f7361310f79"
+definition_asset_id = "mcp-oauth-dcr-cimd"
+implementation_asset_id = "mcp-oauth-dcr-cimd-flex"
+
+# enable_stop_iteration (used for /oauth/register and /oauth/token) needs Omni/Flex 1.9.3+.
+[package.metadata.flex]
+min-version = "1.9.3"
+
+[dependencies]
+# No JWT or XML validation is used, so the default `jwt` and `xml_validator` features are off
+# to keep the WASM small. enable_stop_iteration buffers headers+body in one step so those
+# endpoints are answered by this policy and never forwarded to the MCP upstream.
+pdk = { version = "1.10.0", default-features = false, features = ["enable_stop_iteration"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+serde_urlencoded = "0.7"
+anyhow = "1.0"
+base64 = "0.22"
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+getrandom = "0.2"
+hmac = "0.12"
+sha2 = "0.10"
+
+[dev-dependencies]
+# enable_stop_iteration must also be on pdk-unit, or tests that buffer bodies hang.
+pdk-unit = { version = "1.10.0", features = ["enable_stop_iteration", "experimental_local_mode"] }
+
+[profile.release]
+lto = true
+opt-level = 'z'
+strip = "debuginfo"

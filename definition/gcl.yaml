@@ -1,0 +1,141 @@
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: Extension
+metadata:
+  labels:
+    title: MCP OAuth Client Registration (DCR + CIMD)
+    description: >-
+      Lets MCP clients self-register (CIMD or DCR) in front of an IdP that supports neither,
+      by brokering OAuth to one pre-registered IdP app. Stateless.
+    category: Security
+    metadata/interfaceScope: api
+    metadata/capabilities/assetTypes: mcp,http
+spec:
+  extends:
+    - name: extension-definition
+      namespace: default
+  properties:
+    publicBaseUrl:
+      type: string
+      format: uri
+      description: >-
+        External URL of this API instance as MCP clients see it, without a trailing slash,
+        e.g. https://gateway.example.com/mcp-server. Used as the OAuth issuer and to build
+        every discovery and callback URL. Its path must equal the API instance base path.
+    mcpResourcePath:
+      type: string
+      default: /mcp
+      description: Path of the MCP endpoint relative to publicBaseUrl. Advertised as the protected resource.
+    upstreamAuthorizeUrl:
+      type: string
+      format: uri
+      description: Authorization endpoint of the real IdP. Users' browsers are redirected here.
+    upstreamTokenService:
+      type: string
+      format: service
+      description: Full token endpoint URL of the real IdP. The gateway calls it to redeem codes and refresh tokens.
+    upstreamClientId:
+      type: string
+      description: Client ID of the single application pre-registered at the IdP for this gateway.
+    upstreamClientSecret:
+      type: string
+      description: Client secret of the pre-registered IdP application. Leave empty for a public IdP client.
+      "@context":
+        "@characteristics":
+          - "security:sensitive"
+    upstreamClientAuthMethod:
+      type: string
+      enum:
+        - client_secret_post
+        - client_secret_basic
+        - none
+      default: client_secret_post
+      description: How the gateway authenticates to the IdP token endpoint.
+    upstreamScope:
+      type: string
+      description: >-
+        If set, always sent to the IdP instead of the scope the MCP client requested
+        (e.g. "api://mcp-server/.default offline_access" for Entra ID).
+    scopesSupported:
+      type: array
+      items:
+        type: string
+      description: Scopes advertised in discovery metadata.
+    signingSecret:
+      type: string
+      description: >-
+        HMAC-SHA256 key (at least 32 characters) that signs client IDs, state, wrapped codes and
+        wrapped refresh tokens. Use the same value on every replica. Rotating it invalidates all
+        registrations and refresh tokens.
+      "@context":
+        "@characteristics":
+          - "security:sensitive"
+    enableDcr:
+      type: boolean
+      default: true
+      description: Accept Dynamic Client Registration (RFC 7591) at /oauth/register.
+    enableCimd:
+      type: boolean
+      default: false
+      description: >-
+        Accept HTTPS client_id URLs (Client ID Metadata Documents). Requires at least one
+        cimdTrustedHosts entry.
+    cimdTrustedHosts:
+      type: array
+      items:
+        type: string
+        format: service
+      description: >-
+        Origins allowed to host Client ID Metadata Documents, e.g. https://client.example.com:443.
+        CIMD client_ids on any other host are rejected; the gateway cannot fetch arbitrary URLs.
+    cimdCacheTtlSeconds:
+      type: integer
+      default: 300
+      minimum: 0
+      maximum: 86400
+      description: How long a fetched metadata document is cached per worker.
+    allowLoopbackRedirects:
+      type: boolean
+      default: true
+      description: Allow DCR clients to register http://127.0.0.1, http://[::1] and http://localhost redirect URIs (native/CLI clients).
+    allowedRedirectUris:
+      type: array
+      items:
+        type: string
+      description: >-
+        Non-loopback redirect URIs DCR clients may register. An entry ending in "/" matches as a
+        prefix; any other entry must match exactly.
+    clientRegistrationTtlSeconds:
+      type: integer
+      default: 7776000
+      minimum: 0
+      description: Lifetime of a DCR client_id and of wrapped refresh tokens. 0 means no expiry.
+    challengeUnauthenticated:
+      type: boolean
+      default: true
+      description: >-
+        Answer MCP requests that carry no Authorization header with a 401 pointing to the
+        protected-resource metadata, and add resource_metadata to 401s from later policies.
+    requireConsent:
+      type: boolean
+      default: true
+      description: >-
+        Show a gateway consent page (client name, client_id host, redirect host) before sending
+        the user to the IdP, and bind the sign-in to that browser with a cookie. The MCP spec
+        requires per-client consent for proxies that use one static IdP client ID; only disable
+        it if the IdP itself shows equivalent per-client consent.
+  required:
+    - publicBaseUrl
+    - mcpResourcePath
+    - upstreamAuthorizeUrl
+    - upstreamTokenService
+    - upstreamClientId
+    - upstreamClientAuthMethod
+    - signingSecret
+    - enableDcr
+    - enableCimd
+    - cimdCacheTtlSeconds
+    - allowLoopbackRedirects
+    - clientRegistrationTtlSeconds
+    - challengeUnauthenticated
+    - requireConsent
