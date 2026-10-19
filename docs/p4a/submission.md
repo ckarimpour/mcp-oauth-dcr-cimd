@@ -60,6 +60,7 @@ pointer is added to `401`s from later policies.
 | `upstreamAuthorizeUrl`, `upstreamTokenService` | The IdP's authorize and token endpoints |
 | `upstreamClientId`, `upstreamClientSecret`, `upstreamClientAuthMethod` | The pre-registered IdP app |
 | `upstreamScope` | Scope always sent to the IdP (e.g. Entra `api://…/.default offline_access`) |
+| `scopesSupported` | Scopes clients may request when `upstreamScope` isn't set (one of the two is required) |
 | `signingSecret` | Key that signs client IDs and state, and encrypts wrapped codes and tokens |
 | `enableCimd`, `cimdTrustedHosts` | CIMD, limited to allow-listed client hosts |
 | `enableDcr`, `allowLoopbackRedirects`, `allowedRedirectUris` | DCR and its redirect-URI policy |
@@ -74,7 +75,7 @@ upstreamTokenService: https://login.microsoftonline.com:443/TENANT_ID/oauth2/v2.
 upstreamClientId: UPSTREAM_CLIENT_ID
 upstreamClientSecret: UPSTREAM_CLIENT_SECRET
 upstreamScope: "api://UPSTREAM_APP_ID/.default offline_access"
-signingSecret: GENERATE_32_PLUS_RANDOM_CHARACTERS
+signingSecret: <output of openssl rand -base64 48>
 enableCimd: true
 cimdTrustedHosts: ["https://client.example.com:443"]
 enableDcr: true

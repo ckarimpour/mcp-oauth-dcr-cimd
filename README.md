@@ -20,9 +20,11 @@ MCP client ──(2) MCP calls with IdP access token──▶ Gateway ──JWT 
 - It serves RFC 9728 protected-resource metadata and RFC 8414 authorization-server metadata. The
   metadata advertises `registration_endpoint` and `client_id_metadata_document_supported`.
 - DCR clients get a signed, self-contained `client_id`. CIMD clients are accepted from trusted hosts.
-- The browser is sent to the real IdP using one pre-registered application. PKCE is end-to-end:
-  the MCP client's `code_challenge` goes to the IdP, and its `code_verifier` is forwarded at
-  `/token`.
+- The browser is sent to the real IdP using one pre-registered application. The gateway verifies
+  PKCE itself at `/token` (S256, constant time) before calling the IdP, and also forwards the
+  challenge and verifier so an IdP that enforces PKCE checks it too.
+- Clients can only request scopes you allow (`scopesSupported`), or always get the fixed
+  `upstreamScope`. The consent page lists them.
 - Access tokens are the IdP's own tokens. A standard **JWT Validation** (or OAuth 2.0 Token
   Introspection) policy validates them on MCP calls.
 - **Stateless.** Client IDs, `state`, codes and refresh tokens are HMAC-signed values. It works
@@ -33,7 +35,7 @@ The full behaviour is in [docs/spec.md](docs/spec.md).
 ## Status
 
 Builds against PDK 1.10.0 with Rust 1.99.1:
-- all 62 tests pass (`cargo test`): 48 logic tests plus 14 `pdk-unit` tests that run the real
+- all 80 tests pass (`cargo test`): 65 logic tests plus 15 `pdk-unit` tests that run the real
   filters in-process;
 - `cargo clippy` is clean for host and `wasm32-wasip1`, and `cargo fmt --check` passes;
 - `cargo build --release --target wasm32-wasip1` produces a ~1 MB module that imports only
@@ -141,8 +143,9 @@ upstreamTokenService: https://login.microsoftonline.com:443/TENANT_ID/oauth2/v2.
 upstreamClientId: UPSTREAM_CLIENT_ID
 upstreamClientSecret: UPSTREAM_CLIENT_SECRET          # sensitive
 upstreamClientAuthMethod: client_secret_post
-upstreamScope: "api://UPSTREAM_APP_ID/.default offline_access"
-signingSecret: GENERATE_32_PLUS_RANDOM_CHARACTERS      # sensitive; same on every replica
+upstreamScope: "api://UPSTREAM_APP_ID/.default offline_access"   # or scopesSupported
+scopesSupported: ["mcp.read"]                         # advertised; bounds client scopes
+signingSecret: <output of openssl rand -base64 48>    # sensitive; same on every replica
 enableDcr: true
 allowLoopbackRedirects: true                          # CLI/desktop clients
 allowedRedirectUris:
@@ -195,6 +198,17 @@ openssl rand -base64 48
   are only signed, because they contain nothing secret.
 - **Redirect URIs are strict.** Control characters, whitespace and `javascript:` / `data:` /
   `vbscript:` / `file:` schemes are rejected, so a redirect URI can't inject headers or script.
+  Dot segments (literal or percent-encoded), encoded slashes and backslashes are rejected, and
+  prefix entries match on parsed scheme, host and path, so `…/oauth/../` can't escape a prefix.
+  A prefix entry must name a host: a bare `https://` is refused at configuration time.
+- **PKCE is enforced at the gateway**, not left to the IdP. The gateway adds its own client
+  credentials when it calls the IdP, so it can't assume the IdP binds the verifier to the client.
+- **Scopes are bounded.** All clients share one IdP app, so a client could otherwise ask for any
+  scope that app holds (for example tenant-wide Graph scopes). Clients may only request
+  `scopesSupported` (plus `offline_access`), refreshes can only narrow the granted scope, and a
+  `resource` that isn't this MCP server is refused (RFC 8707).
+- **Strong signing secret required.** Placeholder and low-entropy values are refused at
+  configuration time. Separate signing and encryption keys are derived from the secret.
 - **Bad upstream credentials show up as gateway errors.** If the IdP rejects the gateway's own
   client ID or secret, MCP clients get `502 server_error` (logged at error level), not
   `invalid_client`. That stops clients from re-registering in a loop.
@@ -216,6 +230,10 @@ cargo test
 - rejection of callbacks from a browser that didn't see the consent page;
 - fail-closed behaviour without randomness;
 - binding codes and refresh tokens to the client;
+- gateway-side PKCE (wrong, missing and malformed verifiers);
+- scope restriction, consent-page scope display, refresh narrowing and RFC 8707 `resource`;
+- prefix-redirect escapes (`../`, `%2e%2e`, backslash) and over-broad prefix entries;
+- oversized registrations, weak signing secrets, `id_token` removal;
 - Basic-auth encoding to the IdP, and mapping of IdP errors.
 
 **Filter tests** (`src/filter_tests.rs`, `pdk-unit`) drive the real `configure`, request filter
@@ -225,6 +243,7 @@ and response filter. They cover:
 - `resource_metadata` added to upstream 401s;
 - the full register → authorize → callback → token flow against a mocked IdP;
 - IdP rejections and credential errors, and an unreachable IdP;
+- a wrong PKCE verifier never reaching the IdP;
 - the missing binding cookie;
 - local mode and invalid configuration.
 

@@ -3,6 +3,8 @@
 //! Pure OAuth facade logic: discovery metadata, DCR, authorize, callback and token handling.
 //! Nothing here touches the PDK runtime, so all of it is unit-tested directly.
 
+use std::collections::BTreeSet;
+
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -20,6 +22,20 @@ const WELL_KNOWN_OIDC: &str = "/.well-known/openid-configuration";
 const STATE_TTL_SECS: u64 = 600;
 const CODE_TTL_SECS: u64 = 300;
 const MIN_SECRET_LEN: usize = 32;
+const MIN_SECRET_DISTINCT_CHARS: usize = 12;
+const MIN_SECRET_BITS: f64 = 128.0;
+/// Substrings of the example values in this project's docs and common placeholders.
+const PLACEHOLDER_SECRET_MARKERS: [&str; 8] = [
+    "changeme",
+    "change_me",
+    "placeholder",
+    "generate",
+    "your_",
+    "your-",
+    "example",
+    "secret_at_least",
+];
+const OFFLINE_ACCESS: &str = "offline_access";
 const MAX_REDIRECT_URIS: usize = 10;
 const MAX_REDIRECT_URI_LEN: usize = 2048;
 const MAX_CLIENT_NAME_CHARS: usize = 200;
@@ -35,7 +51,7 @@ const AUTHORIZE_PARAMS: [&str; 8] = [
     "code_challenge_method",
     "resource",
 ];
-const TOKEN_PARAMS: [&str; 7] = [
+const TOKEN_PARAMS: [&str; 8] = [
     "grant_type",
     "code",
     "redirect_uri",
@@ -43,6 +59,7 @@ const TOKEN_PARAMS: [&str; 7] = [
     "code_verifier",
     "refresh_token",
     "scope",
+    "resource",
 ];
 const GRANT_TYPES: [&str; 2] = ["authorization_code", "refresh_token"];
 
@@ -65,10 +82,13 @@ pub struct RedirectPolicy {
 
 impl RedirectPolicy {
     pub fn allows(&self, redirect_uri: &str) -> bool {
+        if !uri::is_safe_redirect_uri(redirect_uri) {
+            return false;
+        }
         (self.allow_loopback && uri::is_loopback_http(redirect_uri))
             || self.allowed.iter().any(|allowed| {
                 if allowed.ends_with('/') {
-                    redirect_uri.starts_with(allowed.as_str())
+                    uri::matches_prefix(allowed, redirect_uri)
                 } else {
                     redirect_uri == allowed
                 }
@@ -133,6 +153,146 @@ fn non_empty(value: Option<String>) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+fn is_secure_or_loopback(parsed: &uri::ParsedUri) -> bool {
+    parsed.scheme == "https"
+        || (parsed.scheme == "http"
+            && matches!(parsed.host.as_str(), "127.0.0.1" | "[::1]" | "localhost"))
+}
+
+/// Rejects short, placeholder and low-entropy signing secrets. Every DCR client_id is a public
+/// HMAC sample, so a guessable secret could be brute-forced offline.
+fn check_signing_secret(secret: &str) -> Result<(), String> {
+    const GENERATE_HINT: &str = "generate one with `openssl rand -base64 48`";
+    if secret.len() < MIN_SECRET_LEN {
+        return Err(format!(
+            "signingSecret must be at least {MIN_SECRET_LEN} characters; {GENERATE_HINT}"
+        ));
+    }
+    let lower = secret.to_ascii_lowercase();
+    if PLACEHOLDER_SECRET_MARKERS.iter().any(|m| lower.contains(m)) {
+        return Err(format!(
+            "signingSecret looks like a placeholder; {GENERATE_HINT}"
+        ));
+    }
+    let distinct = secret.chars().collect::<BTreeSet<_>>().len();
+    let alphabet: u32 = [
+        (secret.chars().any(|c| c.is_ascii_lowercase()), 26),
+        (secret.chars().any(|c| c.is_ascii_uppercase()), 26),
+        (secret.chars().any(|c| c.is_ascii_digit()), 10),
+        (secret.chars().any(|c| !c.is_ascii_alphanumeric()), 32),
+    ]
+    .iter()
+    .filter(|(present, _)| *present)
+    .map(|(_, size)| size)
+    .sum();
+    let estimated_bits = secret.chars().count() as f64 * f64::from(alphabet.max(1)).log2();
+    if distinct < MIN_SECRET_DISTINCT_CHARS || estimated_bits < MIN_SECRET_BITS {
+        return Err(format!(
+            "signingSecret has too little entropy; {GENERATE_HINT}"
+        ));
+    }
+    Ok(())
+}
+
+/// RFC 6749 section 3.3 scope-token: printable ASCII without space, `"` or `\`.
+fn is_scope_token(scope: &str) -> bool {
+    !scope.is_empty()
+        && scope
+            .bytes()
+            .all(|b| b == 0x21 || (0x23..=0x5b).contains(&b) || (0x5d..=0x7e).contains(&b))
+}
+
+/// Splits a space-separated scope string into unique tokens, keeping order.
+fn scope_tokens(scope: &str) -> Vec<&str> {
+    let mut tokens: Vec<&str> = Vec::new();
+    for token in scope.split(' ').filter(|t| !t.is_empty()) {
+        if !tokens.contains(&token) {
+            tokens.push(token);
+        }
+    }
+    tokens
+}
+
+impl OAuthSettings {
+    /// The scope to request from the IdP at /authorize. With `upstreamScope` set it is always that
+    /// value. Otherwise the client may only request scopes from `scopesSupported` (plus
+    /// `offline_access` for refresh tokens), and gets all of `scopesSupported` if it asks for none.
+    fn effective_scope(&self, requested: Option<&str>) -> Result<String, String> {
+        if let Some(fixed) = &self.upstream_scope {
+            return Ok(fixed.clone());
+        }
+        let requested = requested.map(scope_tokens).unwrap_or_default();
+        if requested.is_empty() {
+            return Ok(self.scopes_supported.join(" "));
+        }
+        match requested
+            .iter()
+            .find(|s| **s != OFFLINE_ACCESS && !self.scopes_supported.iter().any(|a| a == *s))
+        {
+            Some(bad) => Err(format!(
+                "scope '{}' is not supported",
+                truncate_chars(bad, 64)
+            )),
+            None => Ok(requested.join(" ")),
+        }
+    }
+
+    /// The scope to send on a refresh: `upstreamScope` if set, else the client's requested
+    /// scope, which may only narrow the scope granted at authorization.
+    fn refresh_scope(
+        &self,
+        granted: &str,
+        requested: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        if let Some(fixed) = &self.upstream_scope {
+            return Ok(Some(fixed.clone()));
+        }
+        let granted = scope_tokens(granted);
+        let requested = match requested.map(scope_tokens) {
+            Some(tokens) if !tokens.is_empty() => tokens,
+            _ => return Ok(Some(granted.join(" ")).filter(|s| !s.is_empty())),
+        };
+        match requested.iter().find(|s| !granted.contains(s)) {
+            Some(bad) => Err(format!(
+                "scope '{}' was not granted to this refresh token",
+                truncate_chars(bad, 64)
+            )),
+            None => Ok(Some(requested.join(" "))),
+        }
+    }
+
+    /// RFC 8707: a `resource` parameter, if sent, must name this MCP server.
+    fn resource_matches(&self, resource: Option<&str>) -> bool {
+        match resource {
+            None => true,
+            Some(resource) => {
+                resource.trim_end_matches('/') == self.resource_url.trim_end_matches('/')
+            }
+        }
+    }
+
+    /// Scope hint for `WWW-Authenticate` challenges.
+    pub fn challenge_scope(&self) -> Option<String> {
+        let scopes: Vec<String> = if !self.scopes_supported.is_empty() {
+            self.scopes_supported.clone()
+        } else {
+            self.upstream_scope
+                .as_deref()
+                .map(scope_tokens)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|s| *s != OFFLINE_ACCESS)
+                .map(str::to_string)
+                .collect()
+        };
+        Some(scopes.join(" ")).filter(|s| !s.is_empty())
+    }
+}
+
+fn truncate_chars(value: &str, max: usize) -> String {
+    value.chars().take(max).collect()
+}
+
 impl OAuthSettings {
     pub fn build(input: OAuthInput) -> Result<Self, String> {
         let issuer = input
@@ -144,8 +304,7 @@ impl OAuthSettings {
             return Err("publicBaseUrl must not contain a query or fragment".into());
         }
         let parsed = uri::parse(&issuer).ok_or("publicBaseUrl is not a valid URL")?;
-        let loopback = matches!(parsed.host.as_str(), "127.0.0.1" | "[::1]" | "localhost");
-        if !(parsed.scheme == "https" || (parsed.scheme == "http" && loopback)) {
+        if !is_secure_or_loopback(&parsed) {
             return Err("publicBaseUrl must use https (http is allowed only on loopback)".into());
         }
         let secure_cookies = parsed.scheme == "https";
@@ -159,16 +318,17 @@ impl OAuthSettings {
             return Err("mcpResourcePath must start with '/'".into());
         }
 
-        if input.signing_secret.len() < MIN_SECRET_LEN {
-            return Err(format!(
-                "signingSecret must be at least {MIN_SECRET_LEN} characters"
-            ));
-        }
+        check_signing_secret(&input.signing_secret)?;
 
         let upstream_authorize_url = input.upstream_authorize_url.trim().to_string();
         match uri::parse(&upstream_authorize_url) {
-            Some(u) if (u.scheme == "https" || u.scheme == "http") && !u.has_fragment => {}
-            _ => return Err("upstreamAuthorizeUrl must be an absolute http(s) URL".into()),
+            Some(u) if !u.has_fragment && !u.has_userinfo && is_secure_or_loopback(&u) => {}
+            _ => {
+                return Err(
+                    "upstreamAuthorizeUrl must be an absolute https URL (http only on loopback)"
+                        .into(),
+                )
+            }
         }
 
         let upstream_auth = match input.upstream_client_auth_method.as_str() {
@@ -199,14 +359,19 @@ impl OAuthSettings {
                 .filter(|u| !u.is_empty())
                 .collect(),
         };
-        if let Some(bad) = redirect_policy
-            .allowed
-            .iter()
-            .find(|u| !uri::is_absolute_without_fragment(u))
-        {
-            return Err(format!(
-                "allowedRedirectUris entry '{bad}' is not an absolute URI"
-            ));
+        for entry in &redirect_policy.allowed {
+            if entry.ends_with('/') {
+                if !uri::is_valid_prefix_entry(entry) {
+                    return Err(format!(
+                        "allowedRedirectUris prefix entry '{entry}' must be an http(s) URL with a \
+                         host and a path ending in '/', without credentials, query or dot segments"
+                    ));
+                }
+            } else if !uri::is_safe_redirect_uri(entry) {
+                return Err(format!(
+                    "allowedRedirectUris entry '{entry}' is not a valid absolute redirect URI"
+                ));
+            }
         }
         if input.enable_dcr && redirect_policy.is_empty() {
             return Err(
@@ -215,6 +380,27 @@ impl OAuthSettings {
         }
         if input.client_registration_ttl_seconds < 0 {
             return Err("clientRegistrationTtlSeconds must not be negative".into());
+        }
+        let upstream_scope = non_empty(input.upstream_scope);
+        let scopes_supported: Vec<String> = input
+            .scopes_supported
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        // Every client reaches the IdP through one shared app, so client-requested scopes must
+        // never pass through unrestricted.
+        if upstream_scope.is_none() && scopes_supported.is_empty() {
+            return Err(
+                "set upstreamScope or scopesSupported: client-requested scopes are only accepted \
+                 from scopesSupported"
+                    .into(),
+            );
+        }
+        if let Some(bad) = scopes_supported.iter().find(|s| !is_scope_token(s)) {
+            return Err(format!(
+                "scopesSupported entry '{bad}' is not a valid scope"
+            ));
         }
 
         Ok(Self {
@@ -230,8 +416,8 @@ impl OAuthSettings {
             upstream_client_id: input.upstream_client_id.trim().to_string(),
             upstream_client_secret,
             upstream_auth,
-            upstream_scope: non_empty(input.upstream_scope),
-            scopes_supported: input.scopes_supported,
+            upstream_scope,
+            scopes_supported,
             sealer: Sealer::new(&input.signing_secret),
             enable_dcr: input.enable_dcr,
             enable_cimd: input.enable_cimd,
@@ -423,6 +609,11 @@ struct SealedState {
     /// ...and the fingerprint of its value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     bh: Option<String>,
+    /// The client's S256 PKCE code_challenge, verified by the gateway at /token.
+    cc: String,
+    /// The scope requested from the IdP, after the scopesSupported restriction.
+    #[serde(default)]
+    sc: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -431,6 +622,11 @@ struct SealedCode {
     c: String,
     cf: String,
     ru: String,
+    /// PKCE code_challenge carried from the authorization request.
+    cc: String,
+    /// Scope granted at authorization; bounds later refreshes.
+    #[serde(default)]
+    sc: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -438,6 +634,9 @@ struct SealedRefresh {
     /// The IdP's refresh token.
     r: String,
     cf: String,
+    /// Scope granted at authorization; a refresh may only narrow it.
+    #[serde(default)]
+    sc: String,
 }
 
 /// Opens a DCR client_id issued by [`register`].
@@ -493,9 +692,18 @@ pub fn authorization_server_metadata(o: &OAuthSettings) -> Value {
     metadata
 }
 
-/// `WWW-Authenticate` value with `resource_metadata`, or `None` if `existing` already has it.
-pub fn challenge_with_metadata(existing: Option<&str>, prm_url: &str) -> Option<String> {
-    let parameter = format!("resource_metadata=\"{prm_url}\"");
+/// `WWW-Authenticate` value with `resource_metadata` (and `scope`, when known and not already
+/// present), or `None` if `existing` already has `resource_metadata`.
+pub fn challenge_with_metadata(
+    existing: Option<&str>,
+    prm_url: &str,
+    scope: Option<&str>,
+) -> Option<String> {
+    let mut parameter = format!("resource_metadata=\"{prm_url}\"");
+    let has_scope = existing.is_some_and(|value| value.contains("scope="));
+    if let Some(scope) = scope.filter(|_| !has_scope) {
+        parameter.push_str(&format!(", scope=\"{scope}\""));
+    }
     match existing.map(str::trim) {
         Some(value) if value.contains("resource_metadata=") => None,
         Some(value) if value.eq_ignore_ascii_case("bearer") => Some(format!("Bearer {parameter}")),
@@ -508,6 +716,22 @@ pub fn challenge_with_metadata(existing: Option<&str>, prm_url: &str) -> Option<
             Some(format!("{value}, {parameter}"))
         }
         _ => Some(format!("Bearer {parameter}")),
+    }
+}
+
+/// `existing` comma-separated header list with `token` appended, or `None` if it's already
+/// there (compared case-insensitively).
+pub fn with_list_token(existing: Option<&str>, token: &str) -> Option<String> {
+    match existing.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Some(token.to_string()),
+        Some(value)
+            if value
+                .split(',')
+                .any(|item| item.trim().eq_ignore_ascii_case(token) || item.trim() == "*") =>
+        {
+            None
+        }
+        Some(value) => Some(format!("{value}, {token}")),
     }
 }
 
@@ -552,12 +776,12 @@ pub fn register(
     for value in redirect_uris {
         let redirect_uri = value
             .as_str()
-            .filter(|u| u.len() <= MAX_REDIRECT_URI_LEN && uri::is_absolute_without_fragment(u))
+            .filter(|u| u.len() <= MAX_REDIRECT_URI_LEN && uri::is_safe_redirect_uri(u))
             .ok_or_else(|| {
                 OAuthError::new(
                     400,
                     "invalid_redirect_uri",
-                    "redirect_uris must be absolute URIs without fragments",
+                    "redirect_uris must be absolute URIs without fragments or dot segments",
                 )
             })?;
         if !o.redirect_policy.allows(redirect_uri) {
@@ -582,7 +806,7 @@ pub fn register(
     let client_name = match request.get("client_name") {
         None | Some(Value::Null) => None,
         Some(Value::String(name)) if name.chars().count() <= MAX_CLIENT_NAME_CHARS => {
-            Some(name.trim().to_string()).filter(|n| !n.is_empty())
+            Some(consent::sanitize_name(name)).filter(|n| !n.is_empty())
         }
         Some(_) => {
             return Err(invalid_client_metadata(
@@ -601,6 +825,12 @@ pub fn register(
         .sealer
         .seal(KIND_CLIENT, &client, o.registration_expiry(now))
         .map_err(|_| server_error())?;
+    // Never hand out a client_id that /authorize could not open.
+    if client_id.len() > seal::MAX_SEALED_LEN {
+        return Err(invalid_client_metadata(
+            "registration is too large: use fewer or shorter redirect_uris",
+        ));
+    }
 
     let mut response = json!({
         "client_id": client_id,
@@ -647,6 +877,8 @@ fn string_list(
 #[derive(Debug, PartialEq)]
 pub enum BrowserOutcome {
     Redirect(String),
+    /// A redirect that also expires a binding cookie (location, `Set-Cookie` value).
+    RedirectClearingCookie(String, String),
     /// The gateway consent page, shown before the browser goes to the IdP.
     Consent(ConsentPage),
     /// Shown to the user when it is not safe to redirect.
@@ -742,6 +974,13 @@ pub fn authorize(
     if params.get("code_challenge_method") != Some("S256") {
         return fail("invalid_request", "code_challenge_method must be S256");
     }
+    if !o.resource_matches(params.get("resource")) {
+        return fail("invalid_target", "resource must be this MCP server");
+    }
+    let scope = match o.effective_scope(params.get("scope")) {
+        Ok(scope) => scope,
+        Err(description) => return fail("invalid_scope", description.as_str()),
+    };
 
     let browser = if o.require_consent {
         match browser {
@@ -758,6 +997,8 @@ pub fn authorize(
         st: state.map(str::to_string),
         bk: browser.map(|b| b.key.clone()),
         bh: browser.map(|b| seal::fingerprint(&b.value)),
+        cc: code_challenge.to_string(),
+        sc: scope.clone(),
     };
     let sealed_state = match o.sealer.seal(
         KIND_STATE,
@@ -776,8 +1017,8 @@ pub fn authorize(
         ("code_challenge", code_challenge),
         ("code_challenge_method", "S256"),
     ];
-    if let Some(scope) = o.upstream_scope.as_deref().or_else(|| params.get("scope")) {
-        upstream.push(("scope", scope));
+    if !scope.is_empty() {
+        upstream.push(("scope", scope.as_str()));
     }
     let continue_url = uri::append_query(&o.upstream_authorize_url, &upstream);
 
@@ -797,6 +1038,8 @@ pub fn authorize(
         client_host: consent::client_host(&client.client_id),
         redirect_display: consent::redirect_display(redirect_uri),
         loopback: uri::is_loopback_http(redirect_uri),
+        insecure_http: consent::is_insecure_http(redirect_uri),
+        scopes: scope_tokens(&scope),
         resource: &o.resource_url,
         continue_url: &continue_url,
         cancel_url: &cancel_url,
@@ -858,12 +1101,20 @@ pub fn callback(
         );
     }
     let client_state = state.st.as_deref();
+    // The binding has done its job: expire the cookie on every redirect from here on.
+    let finish = |location: String| match &state.bk {
+        Some(key) => BrowserOutcome::RedirectClearingCookie(
+            location,
+            consent::clear_cookie(o.secure_cookies, key),
+        ),
+        None => BrowserOutcome::Redirect(location),
+    };
 
     if let Some(error) = params.get("error") {
         let description: Option<String> = params
             .get("error_description")
             .map(|d| d.chars().take(MAX_ERROR_DESCRIPTION_CHARS).collect());
-        return BrowserOutcome::Redirect(error_redirect(
+        return finish(error_redirect(
             &state.ru,
             sanitize_error_code(error),
             description.as_deref(),
@@ -873,7 +1124,7 @@ pub fn callback(
     }
 
     let server_error = || {
-        BrowserOutcome::Redirect(error_redirect(
+        finish(error_redirect(
             &state.ru,
             "server_error",
             None,
@@ -889,6 +1140,8 @@ pub fn callback(
         c: upstream_code.to_string(),
         cf: state.cf.clone(),
         ru: state.ru.clone(),
+        cc: state.cc.clone(),
+        sc: state.sc.clone(),
     };
     let code = match o.sealer.seal_encrypted(
         KIND_CODE,
@@ -905,7 +1158,7 @@ pub fn callback(
         response.push(("state", client_state));
     }
     response.push(("iss", o.issuer.as_str()));
-    BrowserOutcome::Redirect(uri::append_query(&state.ru, &response))
+    finish(uri::append_query(&state.ru, &response))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -920,6 +1173,8 @@ pub struct UpstreamTokenRequest {
     pub authorization: Option<String>,
     /// Fingerprint of the MCP client, used to bind the re-sealed refresh token.
     pub client_fingerprint: String,
+    /// Scope granted at authorization, carried into the re-sealed refresh token.
+    pub granted_scope: String,
 }
 
 /// client_id from an HTTP Basic `Authorization` header, if one is present.
@@ -988,6 +1243,13 @@ pub fn token_request(
         open_dcr_client(o, &client_id, now).map_err(invalid_client)?;
     }
     let client_fingerprint = seal::fingerprint(&client_id);
+    if !o.resource_matches(params.get("resource")) {
+        return Err(OAuthError::new(
+            400,
+            "invalid_target",
+            "resource must be this MCP server",
+        ));
+    }
 
     let require = |name: &str| {
         params
@@ -995,7 +1257,7 @@ pub fn token_request(
             .ok_or_else(|| invalid_request(format!("{name} is required")))
     };
     let mut form: Vec<(&str, String)> = Vec::new();
-    match require("grant_type")? {
+    let granted_scope = match require("grant_type")? {
         "authorization_code" => {
             let code = require("code")?;
             let redirect_uri = require("redirect_uri")?;
@@ -1014,10 +1276,22 @@ pub fn token_request(
                     "redirect_uri does not match the authorization request",
                 ));
             }
+            // PKCE is verified here, not left to the IdP: the gateway adds its own client
+            // credentials upstream, so the IdP may not bind the verifier to this client.
+            if !seal::is_valid_code_verifier(code_verifier) {
+                return Err(invalid_request("code_verifier is malformed"));
+            }
+            if !seal::pkce_s256_matches(code_verifier, &sealed.cc) {
+                return Err(invalid_grant(
+                    "code_verifier does not match the code_challenge",
+                ));
+            }
             form.push(("grant_type", "authorization_code".into()));
             form.push(("code", sealed.c));
             form.push(("redirect_uri", o.callback_url.clone()));
+            // Still forwarded, as defense in depth for IdPs that also enforce PKCE.
             form.push(("code_verifier", code_verifier.to_string()));
+            sealed.sc
         }
         "refresh_token" => {
             let sealed: SealedRefresh = o
@@ -1027,11 +1301,16 @@ pub fn token_request(
             if sealed.cf != client_fingerprint {
                 return Err(invalid_grant("refresh token was issued to another client"));
             }
+            let scope = o
+                .refresh_scope(&sealed.sc, params.get("scope"))
+                .map_err(|description| OAuthError::new(400, "invalid_scope", description))?;
             form.push(("grant_type", "refresh_token".into()));
             form.push(("refresh_token", sealed.r));
-            if let Some(scope) = o.upstream_scope.as_deref().or_else(|| params.get("scope")) {
-                form.push(("scope", scope.to_string()));
+            if let Some(scope) = &scope {
+                form.push(("scope", scope.clone()));
             }
+            // A narrowed refresh keeps the original grant as the bound for later refreshes.
+            sealed.sc
         }
         _ => {
             return Err(OAuthError::new(
@@ -1040,7 +1319,7 @@ pub fn token_request(
                 "grant_type must be authorization_code or refresh_token",
             ))
         }
-    }
+    };
 
     let secret = o.upstream_client_secret.clone().unwrap_or_default();
     let authorization = match o.upstream_auth {
@@ -1068,6 +1347,7 @@ pub fn token_request(
         form: serde_urlencoded::to_string(&form).map_err(|_| server_error())?,
         authorization,
         client_fingerprint,
+        granted_scope,
     })
 }
 
@@ -1089,12 +1369,13 @@ pub fn upstream_auth_failed() -> OAuthError {
 }
 
 /// Turns the IdP's token response into the response for the MCP client. `nonce` must be fresh
-/// random bytes; it encrypts the wrapped refresh token.
+/// random bytes; it encrypts the wrapped refresh token. The IdP's `id_token` is dropped: its
+/// issuer is the IdP, not this authorization server.
 pub fn token_response(
     o: &OAuthSettings,
     status: u32,
     body: &[u8],
-    client_fingerprint: &str,
+    request: &UpstreamTokenRequest,
     now: u64,
     nonce: &[u8; NONCE_LEN],
 ) -> Result<Vec<u8>, OAuthError> {
@@ -1110,10 +1391,12 @@ pub fn token_response(
                     ))
                 }
             };
+            token.remove("id_token");
             if let Some(Value::String(refresh_token)) = token.get("refresh_token").cloned() {
                 let sealed = SealedRefresh {
                     r: refresh_token,
-                    cf: client_fingerprint.to_string(),
+                    cf: request.client_fingerprint.clone(),
+                    sc: request.granted_scope.clone(),
                 };
                 let sealed = o
                     .sealer
@@ -1175,6 +1458,8 @@ mod tests {
     const NOW: u64 = 1_800_000_000;
     const NONCE: [u8; NONCE_LEN] = [9u8; NONCE_LEN];
     const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+    /// RFC 7636 appendix B: the verifier whose S256 hash is CHALLENGE.
+    const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 
     fn input() -> OAuthInput {
         OAuthInput {
@@ -1201,9 +1486,19 @@ mod tests {
         OAuthSettings::build(input()).unwrap()
     }
 
+    fn dummy_request() -> UpstreamTokenRequest {
+        UpstreamTokenRequest {
+            form: String::new(),
+            authorization: None,
+            client_fingerprint: "f".into(),
+            granted_scope: "mcp.read".into(),
+        }
+    }
+
     fn redirect(outcome: BrowserOutcome) -> String {
         match outcome {
             BrowserOutcome::Redirect(location) => location,
+            BrowserOutcome::RedirectClearingCookie(location, _) => location,
             other => panic!("expected redirect, got {:?}", other),
         }
     }
@@ -1436,16 +1731,51 @@ mod tests {
     fn builds_challenges() {
         let prm = "https://gw.example/mcp-server/.well-known/oauth-protected-resource";
         let expected = format!("Bearer resource_metadata=\"{prm}\"");
-        assert_eq!(challenge_with_metadata(None, prm), Some(expected.clone()));
-        assert_eq!(challenge_with_metadata(Some("Bearer"), prm), Some(expected));
         assert_eq!(
-            challenge_with_metadata(Some("Bearer realm=\"api\""), prm),
+            challenge_with_metadata(None, prm, None),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            challenge_with_metadata(Some("Bearer"), prm, None),
+            Some(expected)
+        );
+        assert_eq!(
+            challenge_with_metadata(Some("Bearer realm=\"api\""), prm, None),
             Some(format!("Bearer realm=\"api\", resource_metadata=\"{prm}\""))
         );
         assert_eq!(
-            challenge_with_metadata(Some("Bearer resource_metadata=\"x\""), prm),
+            challenge_with_metadata(Some("Bearer resource_metadata=\"x\""), prm, None),
             None
         );
+        assert_eq!(
+            challenge_with_metadata(None, prm, Some("mcp.read")),
+            Some(format!(
+                "Bearer resource_metadata=\"{prm}\", scope=\"mcp.read\""
+            ))
+        );
+        // An existing scope parameter is kept, not duplicated.
+        assert_eq!(
+            challenge_with_metadata(Some("Bearer scope=\"a\""), prm, Some("mcp.read")),
+            Some(format!("Bearer scope=\"a\", resource_metadata=\"{prm}\""))
+        );
+        assert_eq!(settings().challenge_scope().as_deref(), Some("mcp.read"));
+    }
+
+    #[test]
+    fn appends_list_tokens_without_duplicates() {
+        assert_eq!(
+            with_list_token(None, "www-authenticate").as_deref(),
+            Some("www-authenticate")
+        );
+        assert_eq!(
+            with_list_token(Some("x-request-id"), "www-authenticate").as_deref(),
+            Some("x-request-id, www-authenticate")
+        );
+        assert_eq!(
+            with_list_token(Some("X-Id, WWW-Authenticate"), "www-authenticate"),
+            None
+        );
+        assert_eq!(with_list_token(Some("*"), "www-authenticate"), None);
     }
 
     #[test]
@@ -1515,7 +1845,7 @@ mod tests {
             name: Some("Example Client".into()),
         };
         let params = Params::from_query_of(&format!(
-            "/a?response_type=code&client_id=x&redirect_uri=https%3A%2F%2Fclient.example%2Fcb&code_challenge={CHALLENGE}&code_challenge_method=S256&scope=mcp.read&resource=https%3A%2F%2Fgw.example%2Fmcp"
+            "/a?response_type=code&client_id=x&redirect_uri=https%3A%2F%2Fclient.example%2Fcb&code_challenge={CHALLENGE}&code_challenge_method=S256&scope=mcp.read&resource=https%3A%2F%2Fgw.example%2Fmcp-server%2Fmcp"
         ));
         let page = consent_page(authorize(&o, &client, &params, NOW, Some(&browser())));
         assert!(page.html.contains("<strong>Example Client</strong>"));
@@ -1621,6 +1951,8 @@ mod tests {
             st: None,
             bk: None,
             bh: None,
+            cc: CHALLENGE.into(),
+            sc: String::new(),
         };
         let state = o.sealer.seal(KIND_STATE, &unbound, NOW + 600).unwrap();
         let query = serde_urlencoded::to_string([
@@ -1686,7 +2018,7 @@ mod tests {
         );
         assert!(page
             .html
-            .contains("an app on this computer (127.0.0.1:6000)"));
+            .contains("an app on this computer (http://127.0.0.1:6000)"));
         assert!(page.html.contains("https://gw.example/mcp-server/mcp"));
 
         let cancel = query_of(&page.cancel_url);
@@ -1783,7 +2115,8 @@ mod tests {
                 NOW,
                 &NONCE
             ),
-            BrowserOutcome::Redirect(_)
+            BrowserOutcome::RedirectClearingCookie(_, clear)
+                if clear == "mcp-auth-k1=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
         ));
     }
 
@@ -1796,7 +2129,7 @@ mod tests {
             ("code", code.as_str()),
             ("redirect_uri", "http://127.0.0.1:6000/cb"),
             ("client_id", client_id.as_str()),
-            ("code_verifier", "verifier"),
+            ("code_verifier", VERIFIER),
         ])
         .unwrap();
         let request = token_request(&o, body.as_bytes(), None, NOW).unwrap();
@@ -1807,16 +2140,15 @@ mod tests {
             form.get("redirect_uri"),
             Some("https://gw.example/mcp-server/oauth/callback")
         );
-        assert_eq!(form.get("code_verifier"), Some("verifier"));
+        assert_eq!(form.get("code_verifier"), Some(VERIFIER));
         assert_eq!(form.get("client_id"), Some("upstream-client"));
         assert_eq!(form.get("client_secret"), Some("upstream-secret"));
 
         // The IdP's refresh token comes back sealed and bound to the client.
         let idp = br#"{"access_token":"at","token_type":"Bearer","refresh_token":"idp-rt","expires_in":3600}"#;
-        let response: Value = serde_json::from_slice(
-            &token_response(&o, 200, idp, &request.client_fingerprint, NOW, &NONCE).unwrap(),
-        )
-        .unwrap();
+        let response: Value =
+            serde_json::from_slice(&token_response(&o, 200, idp, &request, NOW, &NONCE).unwrap())
+                .unwrap();
         assert_eq!(response["access_token"], "at");
         let refresh = response["refresh_token"].as_str().unwrap();
         assert!(refresh.starts_with("v1e."), "refresh tokens are encrypted");
@@ -1864,7 +2196,7 @@ mod tests {
                 ("code", code.as_str()),
                 ("redirect_uri", redirect_uri),
                 ("client_id", client),
-                ("code_verifier", "v"),
+                ("code_verifier", VERIFIER),
             ])
             .unwrap();
             token_request(&o, body.as_bytes(), None, NOW)
@@ -1932,7 +2264,7 @@ mod tests {
                     ("grant_type", "authorization_code"),
                     ("code", "forged"),
                     ("redirect_uri", "x"),
-                    ("code_verifier", "v")
+                    ("code_verifier", VERIFIER)
                 ])
                 .as_bytes(),
                 None,
@@ -1966,7 +2298,7 @@ mod tests {
             ("grant_type", "authorization_code"),
             ("code", code.as_str()),
             ("redirect_uri", "http://127.0.0.1:6000/cb"),
-            ("code_verifier", "v"),
+            ("code_verifier", VERIFIER),
         ])
         .unwrap();
         // client_id supplied through Basic, as some clients do.
@@ -1989,31 +2321,327 @@ mod tests {
             &o,
             400,
             br#"{"error":"invalid_grant","error_description":"AADSTS70008: expired"}"#,
-            "f",
+            &dummy_request(),
             NOW,
             &NONCE,
         )
         .unwrap_err();
         assert_eq!((err.status, err.error), (400, "invalid_grant"));
-        let err = token_response(&o, 401, b"<html>nope</html>", "f", NOW, &NONCE).unwrap_err();
+        let err = token_response(&o, 401, b"<html>nope</html>", &dummy_request(), NOW, &NONCE)
+            .unwrap_err();
         assert_eq!(
             (err.status, err.error),
             (502, "server_error"),
             "IdP 401 = our creds are wrong"
         );
         let body = br#"{"error":"invalid_client","error_description":"bad secret"}"#;
-        let err = token_response(&o, 400, body, "f", NOW, &NONCE).unwrap_err();
+        let err = token_response(&o, 400, body, &dummy_request(), NOW, &NONCE).unwrap_err();
         assert_eq!((err.status, err.error), (502, "server_error"));
         let body = br#"{"error":"unauthorized_client"}"#;
         assert_eq!(
-            token_response(&o, 400, body, "f", NOW, &NONCE)
+            token_response(&o, 400, body, &dummy_request(), NOW, &NONCE)
                 .unwrap_err()
                 .status,
             502
         );
-        let err = token_response(&o, 500, b"", "f", NOW, &NONCE).unwrap_err();
+        let err = token_response(&o, 500, b"", &dummy_request(), NOW, &NONCE).unwrap_err();
         assert_eq!((err.status, err.error), (503, "temporarily_unavailable"));
-        let err = token_response(&o, 200, b"[]", "f", NOW, &NONCE).unwrap_err();
+        let err = token_response(&o, 200, b"[]", &dummy_request(), NOW, &NONCE).unwrap_err();
         assert_eq!(err.status, 502);
+    }
+
+    // ---- P4A review round 1 ------------------------------------------------------------------
+
+    /// Exchanges `code` for `client_id` with the given `code_verifier` (or none).
+    fn exchange(
+        o: &OAuthSettings,
+        client_id: &str,
+        code: &str,
+        verifier: Option<&str>,
+    ) -> Result<UpstreamTokenRequest, OAuthError> {
+        let mut pairs = vec![
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", "http://127.0.0.1:6000/cb"),
+            ("client_id", client_id),
+        ];
+        if let Some(verifier) = verifier {
+            pairs.push(("code_verifier", verifier));
+        }
+        let body = serde_urlencoded::to_string(&pairs).unwrap();
+        token_request(o, body.as_bytes(), None, NOW)
+    }
+
+    /// Issue #1: the gateway verifies PKCE itself instead of relying on the IdP.
+    #[test]
+    fn pkce_is_verified_at_the_gateway() {
+        let o = settings();
+        let (client_id, code) = code_for(&o);
+
+        let wrong = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXX";
+        let err = exchange(&o, &client_id, &code, Some(wrong)).unwrap_err();
+        assert_eq!(
+            (err.status, err.error),
+            (400, "invalid_grant"),
+            "wrong verifier"
+        );
+
+        let err = exchange(&o, &client_id, &code, None).unwrap_err();
+        assert_eq!(err.error, "invalid_request", "missing verifier");
+
+        let err = exchange(&o, &client_id, &code, Some("too-short")).unwrap_err();
+        assert_eq!(err.error, "invalid_request", "malformed verifier");
+
+        let request = exchange(&o, &client_id, &code, Some(VERIFIER)).unwrap();
+        let form = Params::from_form(request.form.as_bytes()).unwrap();
+        assert_eq!(
+            form.get("code_verifier"),
+            Some(VERIFIER),
+            "still forwarded upstream"
+        );
+    }
+
+    fn authorize_with_scope(
+        o: &OAuthSettings,
+        scope: Option<&str>,
+        resource: Option<&str>,
+    ) -> BrowserOutcome {
+        let mut pairs = vec![
+            ("response_type", "code"),
+            ("redirect_uri", "https://client.example/cb"),
+            ("state", "s"),
+            ("code_challenge", CHALLENGE),
+            ("code_challenge_method", "S256"),
+        ];
+        if let Some(scope) = scope {
+            pairs.push(("scope", scope));
+        }
+        if let Some(resource) = resource {
+            pairs.push(("resource", resource));
+        }
+        let params = Params::from_query_of(&format!(
+            "/a?{}",
+            serde_urlencoded::to_string(&pairs).unwrap()
+        ));
+        authorize(o, &https_client(), &params, NOW, Some(&browser()))
+    }
+
+    /// Issue #2: client scopes are restricted to scopesSupported and shown on the consent page.
+    #[test]
+    fn requested_scopes_are_constrained_and_displayed() {
+        let o = settings(); // scopesSupported = [mcp.read], no upstreamScope
+
+        // Anything outside scopesSupported is refused, e.g. a Graph scope on the shared app.
+        let location = redirect(authorize_with_scope(
+            &o,
+            Some("mcp.read https://graph.microsoft.com/.default"),
+            None,
+        ));
+        let error = query_of(&location);
+        assert_eq!(error.get("error"), Some("invalid_scope"));
+        assert_eq!(error.get("state"), Some("s"));
+
+        // Supported scopes (plus offline_access) pass through and are listed on the consent page.
+        let page = consent_page(authorize_with_scope(
+            &o,
+            Some("mcp.read offline_access"),
+            None,
+        ));
+        assert_eq!(
+            query_of(&page.continue_url).get("scope"),
+            Some("mcp.read offline_access")
+        );
+        assert!(page.html.contains("<li><code>mcp.read</code></li>"));
+        assert!(page.html.contains("<li><code>offline_access</code></li>"));
+
+        // No scope requested: all of scopesSupported.
+        let page = consent_page(authorize_with_scope(&o, None, None));
+        assert_eq!(query_of(&page.continue_url).get("scope"), Some("mcp.read"));
+
+        // A configured upstreamScope always wins over the client's request.
+        let mut fixed = input();
+        fixed.upstream_scope = Some("api://mcp/.default offline_access".into());
+        let fixed = OAuthSettings::build(fixed).unwrap();
+        let page = consent_page(authorize_with_scope(&fixed, Some("anything.else"), None));
+        assert_eq!(
+            query_of(&page.continue_url).get("scope"),
+            Some("api://mcp/.default offline_access")
+        );
+
+        // Without either setting, the policy refuses to load.
+        let mut open = input();
+        open.scopes_supported = vec![];
+        assert!(OAuthSettings::build(open).is_err());
+    }
+
+    /// Issue #2: RFC 8707 resource must name this MCP server, at /authorize and /token.
+    #[test]
+    fn resource_must_be_this_server() {
+        let o = settings();
+        let location = redirect(authorize_with_scope(
+            &o,
+            None,
+            Some("https://other.example/mcp"),
+        ));
+        assert_eq!(query_of(&location).get("error"), Some("invalid_target"));
+        assert!(matches!(
+            authorize_with_scope(&o, None, Some("https://gw.example/mcp-server/mcp/")),
+            BrowserOutcome::Consent(_)
+        ));
+
+        let (client_id, code) = code_for(&o);
+        let body = serde_urlencoded::to_string([
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("redirect_uri", "http://127.0.0.1:6000/cb"),
+            ("client_id", client_id.as_str()),
+            ("code_verifier", VERIFIER),
+            ("resource", "https://other.example/mcp"),
+        ])
+        .unwrap();
+        assert_eq!(
+            token_request(&o, body.as_bytes(), None, NOW)
+                .unwrap_err()
+                .error,
+            "invalid_target"
+        );
+    }
+
+    /// Issue #2: a refresh may narrow, but never widen, the scope granted at authorization.
+    #[test]
+    fn refresh_cannot_widen_scope() {
+        let o = settings();
+        let (client_id, code) = code_for(&o);
+        let request = exchange(&o, &client_id, &code, Some(VERIFIER)).unwrap();
+        assert_eq!(request.granted_scope, "mcp.read");
+        let idp = br#"{"access_token":"at","token_type":"Bearer","refresh_token":"idp-rt"}"#;
+        let response: Value =
+            serde_json::from_slice(&token_response(&o, 200, idp, &request, NOW, &NONCE).unwrap())
+                .unwrap();
+        let refresh = response["refresh_token"].as_str().unwrap().to_string();
+
+        let refresh_with = |scope: Option<&str>| {
+            let mut pairs = vec![
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh.as_str()),
+                ("client_id", client_id.as_str()),
+            ];
+            if let Some(scope) = scope {
+                pairs.push(("scope", scope));
+            }
+            token_request(
+                &o,
+                serde_urlencoded::to_string(&pairs).unwrap().as_bytes(),
+                None,
+                NOW,
+            )
+        };
+        let err = refresh_with(Some("mcp.read admin.write")).unwrap_err();
+        assert_eq!((err.status, err.error), (400, "invalid_scope"));
+        let request = refresh_with(None).unwrap();
+        assert_eq!(
+            Params::from_form(request.form.as_bytes())
+                .unwrap()
+                .get("scope"),
+            Some("mcp.read")
+        );
+        assert!(refresh_with(Some("mcp.read")).is_ok());
+    }
+
+    /// Issue #3: prefix entries can't be escaped with dot segments, and can't be too broad.
+    #[test]
+    fn prefix_redirects_cannot_be_escaped() {
+        let o = settings(); // allowedRedirectUris = ["https://client.example/oauth/"]
+        for escaped in [
+            "https://client.example/oauth/../redirect?to=https://evil.example",
+            "https://client.example/oauth/%2e%2e/redirect",
+            "https://client.example/oauth/%2E%2E%2Fredirect",
+            "https://client.example/oauth/..\\redirect",
+        ] {
+            let body = serde_json::to_vec(&json!({"redirect_uris": [escaped]})).unwrap();
+            let err = register(&o, &body, NOW, None).unwrap_err();
+            assert_eq!(err.error, "invalid_redirect_uri", "{}", escaped);
+        }
+        assert!(register(
+            &o,
+            br#"{"redirect_uris":["https://client.example/oauth/cb"]}"#,
+            NOW,
+            None
+        )
+        .is_ok());
+
+        // A bare scheme would match every redirect URI; custom-scheme or dot-segment prefixes
+        // can't be compared safely.
+        for bad_prefix in [
+            "https://",
+            "https:///",
+            "myapp://cb/",
+            "https://client.example/a/../",
+        ] {
+            let mut i = input();
+            i.allowed_redirect_uris = vec![bad_prefix.to_string()];
+            assert!(OAuthSettings::build(i).is_err(), "{}", bad_prefix);
+        }
+    }
+
+    /// Issue #4: a registration whose client_id would be too long to open is refused up front.
+    #[test]
+    fn oversized_registrations_are_refused() {
+        let o = settings();
+        let uris: Vec<String> = (0..10)
+            .map(|i| format!("http://127.0.0.1:{}/{}", 1000 + i, "a".repeat(1990)))
+            .collect();
+        let body = serde_json::to_vec(&json!({ "redirect_uris": uris })).unwrap();
+        let err = register(&o, &body, NOW, None).unwrap_err();
+        assert_eq!((err.status, err.error), (400, "invalid_client_metadata"));
+    }
+
+    /// Issue #5: placeholder and low-entropy signing secrets are rejected.
+    #[test]
+    fn weak_signing_secrets_are_rejected() {
+        for weak in [
+            "CHANGE_ME_TO_32_PLUS_RANDOM_CHARACTERS",
+            "GENERATE_32_PLUS_RANDOM_CHARACTERS_NOW",
+            "LOCAL_TEST_SECRET_AT_LEAST_32_CHARACTERS",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "passwordpasswordpasswordpassword",
+            "abababababababababababababababab12",
+        ] {
+            let mut i = input();
+            i.signing_secret = weak.into();
+            assert!(OAuthSettings::build(i).is_err(), "{}", weak);
+        }
+        for strong in [
+            "0123456789abcdef0123456789abcdef", // hex, 128 bits
+            "q3Vb9Xl2Rk8sT1mZ0wYc7Pd4Hn6Jf5Ga2EoLuNi8Ks3BtWx9Cy1Dv0Az7Mr4Qp6Ue", // base64-like
+        ] {
+            let mut i = input();
+            i.signing_secret = strong.into();
+            assert!(OAuthSettings::build(i).is_ok(), "{}", strong);
+        }
+    }
+
+    /// Issue #7: the IdP's id_token is never relayed (its issuer is the IdP, not this server).
+    #[test]
+    fn id_token_is_dropped() {
+        let o = settings();
+        let idp = br#"{"access_token":"at","token_type":"Bearer","id_token":"eyJ.idp.token"}"#;
+        let body: Value = serde_json::from_slice(
+            &token_response(&o, 200, idp, &dummy_request(), NOW, &NONCE).unwrap(),
+        )
+        .unwrap();
+        assert!(body.get("id_token").is_none());
+        assert_eq!(body["access_token"], "at");
+    }
+
+    /// Issue #11: the IdP authorize endpoint must be https (http only on loopback).
+    #[test]
+    fn upstream_authorize_url_must_be_https() {
+        let mut i = input();
+        i.upstream_authorize_url = "http://idp.example/authorize".into();
+        assert!(OAuthSettings::build(i).is_err());
+        let mut i = input();
+        i.upstream_authorize_url = "http://localhost:9000/authorize".into();
+        assert!(OAuthSettings::build(i).is_ok());
     }
 }

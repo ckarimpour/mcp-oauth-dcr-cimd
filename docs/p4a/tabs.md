@@ -54,15 +54,15 @@ endpoints, the IdP app credentials and a signing secret. There is no empty-confi
 | `upstreamClientId` | string | — (required) | Client ID of the pre-registered IdP application. |
 | `upstreamClientSecret` | string, sensitive | none | Its client secret. Required unless `upstreamClientAuthMethod` is `none`. |
 | `upstreamClientAuthMethod` | enum | `client_secret_post` | `client_secret_post`, `client_secret_basic` or `none`. |
-| `upstreamScope` | string | none | Sent to the IdP instead of the client's scope (e.g. Entra `api://<app>/.default offline_access`). |
-| `scopesSupported` | array of string | none | Scopes advertised in discovery metadata. |
-| `signingSecret` | string, sensitive | — (required) | At least 32 characters; the same on every replica. Signs client IDs and state; encrypts wrapped codes and refresh tokens. Rotating it invalidates all registrations and refresh tokens. |
+| `upstreamScope` | string | none | Always sent to the IdP, whatever the client asked for (e.g. Entra `api://<app>/.default offline_access`). Set this or `scopesSupported`. |
+| `scopesSupported` | array of string | none | Advertised in discovery metadata. Without `upstreamScope`, clients may only request these (plus `offline_access`). Set this or `upstreamScope`. |
+| `signingSecret` | string, sensitive | — (required) | High-entropy secret: generate with `openssl rand -base64 48`. Placeholder or low-entropy values are refused. Separate keys derived from it sign client IDs and state and encrypt wrapped codes and refresh tokens. Same on every replica; rotating it invalidates all registrations and refresh tokens. |
 | `enableCimd` | boolean | `false` | Accept HTTPS `client_id` URLs. Requires `cimdTrustedHosts`. |
 | `cimdTrustedHosts` | array of string (service) | none | Origins allowed to host client metadata documents, e.g. `https://client.example.com:443`. |
 | `cimdCacheTtlSeconds` | integer | `300` | Per-worker cache lifetime for fetched documents. `0` disables caching. |
 | `enableDcr` | boolean | `true` | Accept DCR at `/oauth/register`. |
 | `allowLoopbackRedirects` | boolean | `true` | Let DCR clients register `http://127.0.0.1`, `[::1]` or `localhost` redirect URIs (CLI and desktop clients). |
-| `allowedRedirectUris` | array of string | none | Other redirect URIs DCR clients may register. An entry ending in `/` is a prefix; otherwise it must match exactly. |
+| `allowedRedirectUris` | array of string | none | Other redirect URIs DCR clients may register. An entry ending in `/` is a prefix: an http(s) URL with a host, matched on scheme, host and path. Other entries must match exactly. |
 | `clientRegistrationTtlSeconds` | integer | `7776000` (90 days) | Lifetime of DCR client IDs and wrapped refresh tokens. `0` means no expiry. |
 | `challengeUnauthenticated` | boolean | `true` | Answer token-less MCP requests with a 401 that points to the metadata, and add that pointer to 401s from later policies. |
 | `requireConsent` | boolean | `true` | Show the gateway consent page and bind the sign-in to the browser. Only disable it if the IdP shows equivalent per-client consent. |
@@ -70,8 +70,10 @@ endpoints, the IdP app credentials and a signing secret. There is no empty-confi
 **`cimdTrustedHosts` entries:** an `https` origin with an explicit port. Only `client_id` URLs on
 these hosts are fetched.
 
-**`allowedRedirectUris` entries:** an absolute URI without a fragment. Control characters and the
-`javascript:`, `data:`, `vbscript:` and `file:` schemes are always rejected.
+**`allowedRedirectUris` entries:** an absolute URI without a fragment. Control characters, dot
+segments (literal or percent-encoded), backslashes and the `javascript:`, `data:`, `vbscript:` and
+`file:` schemes are always rejected. A prefix entry must name a host: a bare `https://` is
+refused.
 
 **Failure behavior** (fail closed):
 - Invalid configuration → the policy doesn't load (secrets are never echoed).
@@ -91,7 +93,7 @@ upstreamTokenService: https://login.microsoftonline.com:443/TENANT_ID/oauth2/v2.
 upstreamClientId: UPSTREAM_CLIENT_ID
 upstreamClientSecret: UPSTREAM_CLIENT_SECRET
 upstreamScope: "api://UPSTREAM_APP_ID/.default offline_access"
-signingSecret: GENERATE_32_PLUS_RANDOM_CHARACTERS
+signingSecret: <output of openssl rand -base64 48>
 enableCimd: true
 cimdTrustedHosts: ["https://client.example.com:443"]
 enableDcr: true
@@ -106,7 +108,8 @@ upstreamAuthorizeUrl: https://idp.example.com/oauth2/authorize
 upstreamTokenService: https://idp.example.com:443/oauth2/token
 upstreamClientId: UPSTREAM_CLIENT_ID
 upstreamClientSecret: UPSTREAM_CLIENT_SECRET
-signingSecret: GENERATE_32_PLUS_RANDOM_CHARACTERS
+scopesSupported: ["mcp.read"]
+signingSecret: <output of openssl rand -base64 48>
 enableDcr: false
 enableCimd: true
 cimdTrustedHosts:
@@ -122,7 +125,8 @@ upstreamAuthorizeUrl: https://idp.example.com/oauth2/authorize
 upstreamTokenService: https://idp.example.com:443/oauth2/token
 upstreamClientId: UPSTREAM_CLIENT_ID
 upstreamClientSecret: UPSTREAM_CLIENT_SECRET
-signingSecret: GENERATE_32_PLUS_RANDOM_CHARACTERS
+scopesSupported: ["mcp.read"]
+signingSecret: <output of openssl rand -base64 48>
 enableDcr: true
 allowLoopbackRedirects: true
 allowedRedirectUris: ["https://web-client.example.com/oauth/callback"]
@@ -137,7 +141,8 @@ upstreamAuthorizeUrl: https://idp.example.com/oauth2/authorize
 upstreamTokenService: https://idp.example.com:443/oauth2/token
 upstreamClientId: TEST_CLIENT_ID
 upstreamClientSecret: TEST_CLIENT_SECRET
-signingSecret: LOCAL_TEST_SECRET_AT_LEAST_32_CHARACTERS
+scopesSupported: ["mcp.read"]
+signingSecret: <output of openssl rand -base64 48>
 ```
 
 ## security
@@ -153,15 +158,25 @@ signingSecret: LOCAL_TEST_SECRET_AT_LEAST_32_CHARACTERS
 - **Per-client consent.** The MCP spec requires a proxy that uses one static IdP client ID to get
   consent for each dynamically registered client. The consent page shows:
   - the client name (marked unverified for DCR; for CIMD, the host that published it),
-  - the MCP server,
-  - the host that will receive access, with a warning for localhost.
+  - the MCP server and the permissions (scopes) requested,
+  - where access will be sent, with a warning for localhost or plain http.
 - **Browser binding.** A random `__Host-` cookie ties each sign-in to the browser that saw the
   consent page. An IdP link copied out of someone else's consent page fails.
-- **PKCE (S256) required**, end to end between the client and the IdP.
-- **Exact redirect-URI matching.** Loopback ports are ignored, per RFC 8252. Control characters
-  and script-capable schemes are rejected.
+- **PKCE (S256) verified at the gateway.** The gateway checks the client's `code_verifier`
+  against the sealed challenge before calling the IdP, and still forwards both for IdPs that
+  also enforce PKCE.
+- **Scopes bounded.** Clients may only request `scopesSupported` (plus `offline_access`) or
+  always get the fixed `upstreamScope`; the consent page lists them; refreshes can only narrow
+  the grant; a `resource` other than this MCP server is refused (RFC 8707).
+- **Exact redirect-URI matching.** Loopback ports are ignored, per RFC 8252. Control
+  characters, script-capable schemes and path traversal are rejected; prefix entries match on
+  parsed scheme, host and path.
+- **Consent page shows the real destination:** `https://host`, plain `http` (with a warning
+  when not on this computer), or the scheme of a private-use redirect. Client names are stripped
+  of control and bidi characters.
 - **Encrypted codes and refresh tokens.** They are bound to the requesting client and expire.
-  Client IDs and state are signed.
+  Client IDs and state are signed. The IdP's `id_token` is never relayed, and the binding cookie
+  is cleared at the callback.
 - **CIMD from trusted hosts only.** Outbound fetches go only to configured services, so a
   `client_id` URL can't be used to make the gateway call internal endpoints (SSRF).
 - **Secrets** are marked sensitive and never logged. Configuration errors never echo the config.

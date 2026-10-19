@@ -25,8 +25,9 @@ type HmacSha256 = Hmac<Sha256>;
 
 const SIGNED_PREFIX: &str = "v1.";
 const ENCRYPTED_PREFIX: &str = "v1e.";
-const MAX_SEALED_LEN: usize = 8192;
+pub(crate) const MAX_SEALED_LEN: usize = 8192;
 const ENCRYPTION_KEY_LABEL: &[u8] = b"mcp-oauth-dcr-cimd/encryption-key/v1";
+const MAC_KEY_LABEL: &[u8] = b"mcp-oauth-dcr-cimd/mac-key/v1";
 
 pub(crate) const NONCE_LEN: usize = 24;
 
@@ -65,18 +66,12 @@ pub struct Sealer {
 
 impl Sealer {
     pub fn new(secret: &str) -> Self {
-        // Separate key for encryption, derived from the secret (HMAC as a KDF).
-        let cipher = <HmacSha256 as Mac>::new_from_slice(secret.as_bytes())
-            .ok()
-            .map(|mut kdf| {
-                kdf.update(ENCRYPTION_KEY_LABEL);
-                kdf.finalize().into_bytes()
-            })
-            .and_then(|key| <XChaCha20Poly1305 as KeyInit>::new_from_slice(&key[..]).ok());
-        Self {
-            mac_key: secret.as_bytes().to_vec(),
-            cipher,
-        }
+        // Independent keys for signing and encryption, each derived from the secret with its own
+        // label (HMAC-SHA256 as a KDF). The raw secret is never used as a key directly.
+        let mac_key = derive_key(secret, MAC_KEY_LABEL).unwrap_or_default();
+        let cipher = derive_key(secret, ENCRYPTION_KEY_LABEL)
+            .and_then(|key| <XChaCha20Poly1305 as KeyInit>::new_from_slice(&key).ok());
+        Self { mac_key, cipher }
     }
 
     fn mac(&self, kind: &str, body: &str) -> Result<HmacSha256, SealError> {
@@ -190,6 +185,12 @@ impl Sealer {
     }
 }
 
+fn derive_key(secret: &str, label: &[u8]) -> Option<Vec<u8>> {
+    let mut kdf = <HmacSha256 as Mac>::new_from_slice(secret.as_bytes()).ok()?;
+    kdf.update(label);
+    Some(kdf.finalize().into_bytes().to_vec())
+}
+
 fn envelope<T: Serialize>(kind: &str, data: &T, exp: u64) -> Result<Vec<u8>, SealError> {
     serde_json::to_vec(&EnvelopeOut {
         k: kind,
@@ -208,6 +209,27 @@ fn open_envelope<T: DeserializeOwned>(kind: &str, json: &[u8], now: u64) -> Resu
         return Err(SealError::Expired);
     }
     Ok(envelope.d)
+}
+
+/// RFC 7636 section 4.1: 43-128 characters from the unreserved set.
+pub fn is_valid_code_verifier(verifier: &str) -> bool {
+    (43..=128).contains(&verifier.len())
+        && verifier
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'))
+}
+
+/// Whether `BASE64URL(SHA256(verifier))` equals `challenge`, compared in constant time.
+pub fn pkce_s256_matches(verifier: &str, challenge: &str) -> bool {
+    let computed = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    constant_time_eq(computed.as_bytes(), challenge.as_bytes())
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
 }
 
 /// Short, stable fingerprint of a value (first 128 bits of SHA-256, base64url).
@@ -368,6 +390,44 @@ mod tests {
             .open_encrypted::<Payload>(KIND_CODE, &signed, 0)
             .is_err());
         assert!(sealer().open::<Payload>(KIND_CODE, &sealed, 0).is_err());
+    }
+
+    #[test]
+    fn derives_distinct_keys_and_never_uses_the_raw_secret() {
+        let secret = "0123456789abcdef0123456789abcdef";
+        let mac = derive_key(secret, MAC_KEY_LABEL).unwrap();
+        let enc = derive_key(secret, ENCRYPTION_KEY_LABEL).unwrap();
+        assert_ne!(mac, enc);
+        assert_ne!(mac, secret.as_bytes());
+        assert_eq!(sealer().mac_key, mac);
+    }
+
+    #[test]
+    fn verifies_pkce_s256() {
+        // RFC 7636 appendix B test vector.
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+        assert!(is_valid_code_verifier(verifier));
+        assert!(pkce_s256_matches(verifier, challenge));
+        assert!(!pkce_s256_matches(
+            "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXX",
+            challenge
+        ));
+        assert!(!pkce_s256_matches(
+            verifier,
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cX"
+        ));
+        assert!(!pkce_s256_matches(verifier, ""));
+        for bad in [
+            "short",
+            &"a".repeat(129),
+            &format!("{}!", "a".repeat(43)),
+            &format!("{} x", "a".repeat(43)),
+        ] {
+            assert!(!is_valid_code_verifier(bad), "{}", bad);
+        }
+        assert!(is_valid_code_verifier(&"a".repeat(43)));
+        assert!(is_valid_code_verifier(&"a".repeat(128)));
     }
 
     #[test]

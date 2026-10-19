@@ -54,19 +54,25 @@ spec:
     upstreamScope:
       type: string
       description: >-
-        If set, always sent to the IdP instead of the scope the MCP client requested
-        (e.g. "api://mcp-server/.default offline_access" for Entra ID).
+        If set, always sent to the IdP, whatever scope the MCP client requested
+        (e.g. "api://mcp-server/.default offline_access" for Entra ID). Set this or
+        scopesSupported.
     scopesSupported:
       type: array
       items:
         type: string
-      description: Scopes advertised in discovery metadata.
+      description: >-
+        Scopes advertised in discovery metadata. Without upstreamScope, clients may only request
+        these (plus offline_access); anything else is refused with invalid_scope. Set this or
+        upstreamScope.
     signingSecret:
       type: string
       description: >-
-        HMAC-SHA256 key (at least 32 characters) that signs client IDs, state, wrapped codes and
-        wrapped refresh tokens. Use the same value on every replica. Rotating it invalidates all
-        registrations and refresh tokens.
+        High-entropy secret (at least 32 characters; generate with `openssl rand -base64 48`).
+        Separate keys are derived from it to sign client IDs and state (HMAC-SHA256) and to
+        encrypt wrapped codes and refresh tokens (XChaCha20-Poly1305). Placeholder and
+        low-entropy values are rejected. Use the same value on every replica; rotating it
+        invalidates all registrations and refresh tokens.
       "@context":
         "@characteristics":
           - "security:sensitive"
@@ -103,8 +109,10 @@ spec:
       items:
         type: string
       description: >-
-        Non-loopback redirect URIs DCR clients may register. An entry ending in "/" matches as a
-        prefix; any other entry must match exactly.
+        Non-loopback redirect URIs DCR clients may register. An entry ending in "/" is a prefix:
+        it must be an http(s) URL with a host and path, and matches on scheme, host and path;
+        any other entry must match exactly. Redirect URIs with dot segments are always
+        rejected.
     clientRegistrationTtlSeconds:
       type: integer
       default: 7776000

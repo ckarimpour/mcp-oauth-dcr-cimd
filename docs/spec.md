@@ -24,7 +24,14 @@ See `definition/gcl.yaml` for every property. Invariants checked at configure ti
 - `publicBaseUrl` is an absolute `https://` URL (or `http://` on a loopback host, for the local
   playground) with no query, fragment or trailing slash.
 - `mcpResourcePath` starts with `/`.
-- `signingSecret` is at least 32 characters.
+- `signingSecret` is at least 32 characters, is not a placeholder (e.g. contains `change_me`,
+  `generate`, `example`), has at least 12 distinct characters and an estimated ≥ 128 bits of
+  entropy. Generate it with `openssl rand -base64 48`.
+- `upstreamAuthorizeUrl` is `https` (or `http` on loopback), without credentials or fragment.
+- `upstreamScope` or `scopesSupported` is set, and every `scopesSupported` entry is a valid scope
+  token. Client-requested scopes never pass through unrestricted.
+- Every `allowedRedirectUris` prefix entry (ending in `/`) is an `http(s)` URL with a host, no
+  credentials, query or dot segments; exact entries are valid redirect URIs.
 - `upstreamClientSecret` is set unless `upstreamClientAuthMethod` is `none`.
 - At least one of `enableDcr` / `enableCimd` is true.
 - If `enableDcr`, at least one redirect source exists (`allowLoopbackRedirects` or a non-empty
@@ -54,47 +61,70 @@ string and any trailing `/`.
 Root-level path-insertion forms (`/.well-known/oauth-authorization-server` + `B`, etc.) are also
 answered, so the same policy works when applied to an API mounted at `/`.
 
+`B/.well-known/openid-configuration` serves the same RFC 8414 OAuth document, as a discovery alias
+for MCP clients that try the OIDC path. This server is not an OpenID provider: the document omits
+`jwks_uri`, `subject_types_supported` and `id_token_signing_alg_values_supported`, and no ID token
+is ever returned (see Token).
+
 ### Response flow
 
 If `challengeUnauthenticated` and the response status is 401, append
 `resource_metadata="<PRM URL>"` to the `WWW-Authenticate` Bearer challenge (or set one) when it is
 missing. This makes 401s from a downstream JWT/introspection policy discoverable by MCP clients.
+Challenges also carry `scope="…"` (`scopesSupported`, else `upstreamScope` without
+`offline_access`) unless one is already present, and `www-authenticate` is appended to any
+existing `Access-Control-Expose-Headers` value (never overwritten).
 
 ### Rules
 
 **Sealed values.** Every sealed payload is a JSON envelope `{k: kind, exp, d}` (`exp` 0 = never),
 bound to its kind.
+- **Keys.** Two independent keys are derived from `signingSecret` with HMAC-SHA256 as a KDF:
+  the MAC key (label `"mcp-oauth-dcr-cimd/mac-key/v1"`) and the encryption key (label
+  `"mcp-oauth-dcr-cimd/encryption-key/v1"`). The raw secret is never used as a key.
 - **Signed** (`client`, `state`): `v1.<base64url(json)>.<base64url(hmac)>`, HMAC-SHA256 over
-  `"<kind>." + body` with `signingSecret`. The holder can read these: they contain only its own
-  redirect URIs, name and state.
-- **Encrypted** (`code`, `refresh`): `v1e.<base64url(nonce || ciphertext)>`, XChaCha20-Poly1305,
-  a random 192-bit nonce, kind as associated data. The key is HMAC-SHA256(`signingSecret`,
-  `"mcp-oauth-dcr-cimd/encryption-key/v1"`). The holder can neither read nor change the IdP code
-  or refresh token inside, so it cannot redeem them at the IdP outside the gateway's client and
-  expiry checks. No randomness from the host → `server_error`.
+  `"<kind>." + body` with the MAC key. The holder can read these: they contain only its own
+  redirect URIs, name, state, PKCE challenge and requested scope.
+- **Encrypted** (`code`, `refresh`): `v1e.<base64url(nonce || ciphertext)>`, XChaCha20-Poly1305
+  with the encryption key, a random 192-bit nonce, kind as associated data. The holder can neither
+  read nor change the IdP code or refresh token inside, so it cannot redeem them at the IdP
+  outside the gateway's checks. No randomness from the host → `server_error`.
+- A sealed value longer than 8192 characters is rejected when opened.
 
 **Client resolution** (`client_id`):
 1. Starts with `https://` → CIMD (rejected if `enableCimd` is false).
 2. Otherwise → opened as a sealed `client` (rejected if `enableDcr` is false).
 
 **DCR** (`POST B/oauth/register`, JSON, ≤ 16 KiB):
-- `redirect_uris` required, 1–10 entries, each ≤ 2048 chars, absolute, no fragment, and allowed
-  by the redirect policy: loopback `http` (127.0.0.1, [::1], localhost) when
-  `allowLoopbackRedirects`, or a match in `allowedRedirectUris` (exact; prefix if entry ends in `/`).
+- `redirect_uris` required, 1–10 entries, each ≤ 2048 chars, absolute, no fragment, no control
+  characters, no `javascript:`/`data:`/`vbscript:`/`file:` scheme, and no path traversal (`.`/`..`
+  segments, `%2e`, `%2f`, `%5c` or `\` in the path). Each must be allowed by the redirect policy:
+  loopback `http` (127.0.0.1, [::1], localhost) when `allowLoopbackRedirects`, or an
+  `allowedRedirectUris` entry: exact string match, or for a prefix entry (ending in `/`) the same
+  scheme and authority and a path starting with the entry's path (compared on parsed parts).
+- `client_name` is stripped of control, bidi-override and zero-width characters.
 - `grant_types` ⊆ {authorization_code, refresh_token}; `response_types` ⊆ {code}.
 - `token_endpoint_auth_method` is always returned as `none` (public clients, PKCE).
 - 201 with `client_id` = sealed `client` {redirect URIs, name, iat, 96-bit random nonce},
   expiring after `clientRegistrationTtlSeconds`. The nonce keeps identical registrations distinct.
   If the host has no randomness, the nonce is omitted and a warning is logged.
+- If the sealed `client_id` would exceed the 8192-character open limit → 400
+  `invalid_client_metadata` (never return a client_id that can't be used).
 
 **CIMD**:
-- URL must be `https`, have a non-root path, no fragment, no userinfo, no `.`/`..` segments,
-  ≤ 2048 chars.
+- URL must be `https`, have a non-root path, no query, fragment or userinfo, no path traversal
+  (`.`/`..` segments, `%2e`, `%2f`, `%5c`, `\`), ≤ 2048 chars. Rejecting queries stops
+  per-query cache misses.
 - Its origin must match a `cimdTrustedHosts` service (default port normalised).
 - GET via that service, 5 s timeout. Status 200, body ≤ 5 KiB, JSON object.
-- Document `client_id` must equal the URL exactly; `redirect_uris` non-empty array of strings;
-  no `client_secret`; `token_endpoint_auth_method` absent or `none`.
-- Parsed result cached per worker for `cimdCacheTtlSeconds` (failures are not cached).
+- Document `client_id` must equal the URL exactly; `redirect_uris` a non-empty array of safe
+  redirect URIs (same rules as DCR, minus the allow-list); no `client_secret`;
+  `token_endpoint_auth_method` absent or `none`. `client_name` is sanitized as for DCR.
+- Parsed result cached per worker for `cimdCacheTtlSeconds`. A failed fetch or invalid document
+  is negatively cached for 30 s, so repeated `/authorize` calls don't re-fetch it.
+- Known limits: the 5 KiB check runs after the PDK HTTP client has buffered the response (it
+  can't bound the read earlier), and refresh tokens issued to a CIMD client are not re-checked
+  against its current document.
 - CIMD redirect URIs are trusted as published by the trusted host; the DCR redirect policy does
   not apply to them.
 
@@ -104,11 +134,16 @@ bound to its kind.
   port is ignored (RFC 8252 §7.3).
 - After that, errors redirect to `redirect_uri` with `error`, `state`, `iss`:
   `response_type` must be `code`; `code_challenge` required (43–128 chars) with
-  `code_challenge_method=S256`.
+  `code_challenge_method=S256`; `resource`, if sent, must equal the protected resource
+  (`invalid_target`, RFC 8707); and the scope must be allowed (`invalid_scope`).
+- **Scope.** With `upstreamScope` set, that value is always requested. Otherwise the client's
+  `scope` may only contain `scopesSupported` entries plus `offline_access`; an empty request gets
+  all of `scopesSupported`. All clients share one IdP app, so any other scope that app holds
+  (e.g. tenant-wide Graph scopes) can never be requested through the gateway.
 - The IdP URL is `upstreamAuthorizeUrl` with the upstream client ID, redirect URI
-  `publicBaseUrl/oauth/callback`, the client's `code_challenge` (PKCE is end-to-end between MCP
-  client and IdP), scope = `upstreamScope` or the client's scope, and `state` = sealed `state`
-  {client hash, redirect URI, client state, browser binding}, 10 min.
+  `publicBaseUrl/oauth/callback`, the client's `code_challenge`, the effective scope, and
+  `state` = sealed `state` {client hash, redirect URI, client state, browser binding,
+  code_challenge, effective scope}, 10 min.
 - `resource` is not forwarded (some IdPs, e.g. Entra v2, reject `resource` alongside `scope`).
 - `requireConsent` false → 302 straight to the IdP URL.
 - `requireConsent` true (default) → 200 consent page. MCP spec, security considerations: proxies
@@ -117,8 +152,11 @@ bound to its kind.
   - the client name (DCR: self-reported and labelled unverified; CIMD: from the metadata
     document, with the `client_id` host that published it),
   - the MCP resource URL,
-  - the redirect host (`host[:port]`, or the scheme for private-use schemes),
-  - for loopback redirects, a warning that access goes to an app on this computer,
+  - the permissions (effective scopes) that will be requested,
+  - the destination: `scheme://host[:port]` for http(s), or just the scheme for private-use
+    schemes such as `myapp://callback` (whose "host" is not a real host),
+  - for loopback redirects, a warning that access goes to an app on this computer; for
+    non-loopback plain `http`, a warning that access travels unencrypted,
   - **Continue** (link to the IdP URL) and **Cancel** (link to `redirect_uri` with
     `error=access_denied`, `state`, `iss`).
   All values are HTML-escaped and names truncated to 120 characters. Headers:
@@ -130,7 +168,8 @@ bound to its kind.
   `HttpOnly; SameSite=Lax; Path=/; Max-Age=600` (+ `Secure` over https). `<key>` is 48 random bits,
   so concurrent sign-ins don't collide. The sealed state carries `<key>` and the value's
   fingerprint. This defeats consent bypass: an IdP link copied from one browser's consent page
-  fails in any other browser.
+  fails in any other browser. The cookie is set when the consent page renders (there is no
+  separate approve POST: Continue is a plain link), and the callback expires it.
 - No randomness from the host while consent is required → error redirect `server_error`
   (fail closed).
 
@@ -140,19 +179,28 @@ bound to its kind.
   `<cookie name>=<value>` whose fingerprint matches; a state with no binding is accepted only
   when `requireConsent` is false. Otherwise → 400 page, before anything is forwarded.
 - IdP `error` → redirect with `error` (+ `error_description`), `state`, `iss`.
-- Otherwise redirect with `code` = encrypted `code` {IdP code, client hash, redirect URI}, 5 min,
-  plus `state` and `iss` (RFC 9207).
+- Otherwise redirect with `code` = encrypted `code` {IdP code, client hash, redirect URI,
+  code_challenge, effective scope}, 5 min, plus `state` and `iss` (RFC 9207).
+- Both redirects expire the binding cookie (`Max-Age=0`).
 
 **Token** (`POST B/oauth/token`, form, ≤ 16 KiB). `client_id` comes from the form or a Basic
 `Authorization` header.
+- `resource`, if sent, must equal the protected resource (`invalid_target`).
 - `authorization_code`: `code`, `redirect_uri`, `code_verifier`, `client_id` required. Sealed code
   must open, its client hash must match `client_id`, its redirect URI must equal `redirect_uri`.
-  A DCR `client_id` must still open as a valid sealed `client`. Forwarded to the IdP with the
-  callback URL as `redirect_uri`, the client's `code_verifier`, and upstream credentials.
-- `refresh_token`: sealed `refresh` must open and match `client_id`. Sends `upstreamScope` if set,
-  otherwise the client's `scope` if present.
-- IdP 200 → returned with `refresh_token` (if any) encrypted as `refresh`, expiring after
-  `clientRegistrationTtlSeconds`; a 200 that is not a JSON object → 502 `server_error`.
+  A DCR `client_id` must still open as a valid sealed `client`.
+- **PKCE is verified by the gateway.** `code_verifier` must be 43–128 unreserved characters
+  (`invalid_request`), and `BASE64URL(SHA256(code_verifier))` must equal the sealed
+  `code_challenge`, compared in constant time (`invalid_grant`). Only then is the IdP called, with
+  the callback URL as `redirect_uri`, the `code_verifier` (defense in depth) and upstream
+  credentials. The gateway adds its own client credentials upstream, so it can't rely on the IdP
+  to bind the verifier to this client.
+- `refresh_token`: sealed `refresh` must open and match `client_id`. Sends `upstreamScope` if set;
+  otherwise the client's `scope`, which may only narrow the scope granted at authorization
+  (`invalid_scope`), or the granted scope if none is sent.
+- IdP 200 → returned with `refresh_token` (if any) encrypted as `refresh` (bound to the client
+  and the granted scope), expiring after `clientRegistrationTtlSeconds`. `id_token` is removed:
+  its issuer is the IdP, not this server. A 200 that is not a JSON object → 502 `server_error`.
 - IdP 401, or `invalid_client` / `unauthorized_client` → 502 `server_error`, logged at error level.
   These mean the gateway's own upstream credentials are wrong; relaying them would make MCP
   clients think their registration is bad and re-register.
@@ -182,14 +230,16 @@ None. The downstream validation policy sets the authentication object.
 - `POST B/oauth/register` with `enableDcr` false → 404 `invalid_request`.
 - Bodies above 16 KiB (by `content-length` or actual size) → 413.
 - `state` from the client is optional and echoed verbatim; if absent, none is returned.
-- Clock: `SystemTime::now()`; failure to read it is treated as an internal error (500), never a
-  panic.
+- Clock: `SystemTime::now()`; never a panic if it fails. Browser endpoints (`/oauth/authorize`,
+  `/oauth/callback`) then answer with the 400 error page; API endpoints (`/oauth/register`,
+  `/oauth/token`) with 500 `server_error` JSON.
 
 ### Error responses
 
 OAuth endpoints return RFC 6749 JSON (`{"error": ..., "error_description": ...}`):
 `invalid_request`, `invalid_client`, `invalid_grant`, `unsupported_grant_type`,
-`invalid_redirect_uri`, `invalid_client_metadata`, `temporarily_unavailable`, `server_error`.
+`invalid_redirect_uri`, `invalid_client_metadata`, `invalid_scope`, `invalid_target`,
+`temporarily_unavailable`, `server_error`.
 Browser endpoints (`authorize`, `callback`) return a minimal `text/plain` 400 when they cannot
 redirect.
 
@@ -228,7 +278,7 @@ upstreamClientId: UPSTREAM_CLIENT_ID
 upstreamClientSecret: UPSTREAM_CLIENT_SECRET
 upstreamClientAuthMethod: client_secret_post
 upstreamScope: "api://mcp-server/.default offline_access"
-signingSecret: CHANGE_ME_TO_32_PLUS_RANDOM_CHARACTERS
+signingSecret: <output of openssl rand -base64 48>
 enableDcr: true
 enableCimd: true
 cimdTrustedHosts: ["https://client.example.com:443"]

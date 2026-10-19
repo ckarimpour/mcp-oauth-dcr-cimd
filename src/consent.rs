@@ -45,6 +45,16 @@ pub fn set_cookie(secure: bool, secret: &BrowserSecret) -> String {
     )
 }
 
+/// `Set-Cookie` value that expires the binding cookie once the callback has used it.
+pub fn clear_cookie(secure: bool, key: &str) -> String {
+    let secure_attribute = if secure { "; Secure" } else { "" };
+    format!(
+        "{}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{}",
+        cookie_name(secure, key),
+        secure_attribute
+    )
+}
+
 /// Value of cookie `name` in a `Cookie` header. Accepts `;` and `,` separators, since proxies may
 /// join several Cookie headers either way.
 pub fn cookie_value<'a>(header: Option<&'a str>, name: &str) -> Option<&'a str> {
@@ -55,19 +65,47 @@ pub fn cookie_value<'a>(header: Option<&'a str>, name: &str) -> Option<&'a str> 
         .map(|(_, value)| value.trim())
 }
 
-/// Human-readable destination of a redirect URI: `host[:port]`, or the scheme for private-use
-/// schemes such as `com.example.app:/callback`.
+/// Human-readable destination of a redirect URI: `scheme://host[:port]` for http(s), so plain
+/// http is visible; otherwise the scheme alone, for private-use schemes such as
+/// `com.example.app:/callback` or `myapp://callback`, whose "host" is not a real host.
 pub fn redirect_display(redirect_uri: &str) -> String {
     match uri::parse(redirect_uri) {
-        Some(parsed) => match parsed.port {
-            Some(port) => format!("{}:{}", parsed.host, port),
-            None => parsed.host,
+        Some(parsed) if parsed.scheme == "https" || parsed.scheme == "http" => match parsed.port {
+            Some(port) => format!("{}://{}:{}", parsed.scheme, parsed.host, port),
+            None => format!("{}://{}", parsed.scheme, parsed.host),
         },
-        None => redirect_uri
+        _ => redirect_uri
             .split_once(':')
-            .map(|(scheme, _)| format!("{scheme}: (an app on this device)"))
+            .map(|(scheme, _)| format!("{}: (an app on this device)", scheme.to_ascii_lowercase()))
             .unwrap_or_else(|| redirect_uri.to_string()),
     }
+}
+
+/// A plain-http destination that is not on this computer: access would travel unencrypted.
+pub fn is_insecure_http(redirect_uri: &str) -> bool {
+    uri::parse(redirect_uri).is_some_and(|parsed| parsed.scheme == "http")
+        && !uri::is_loopback_http(redirect_uri)
+}
+
+/// Removes control, bidi-override and zero-width characters from a client-supplied name, so it
+/// can't visually impersonate another client on the consent page.
+pub fn sanitize_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| !c.is_control() && !is_invisible_formatting(*c))
+        .collect();
+    cleaned.trim().to_string()
+}
+
+fn is_invisible_formatting(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
 }
 
 /// Host of a CIMD client_id, which the gateway fetched from a trusted host and can vouch for.
@@ -85,6 +123,10 @@ pub struct ConsentView<'a> {
     pub client_host: Option<String>,
     pub redirect_display: String,
     pub loopback: bool,
+    /// Destination uses plain http on another machine.
+    pub insecure_http: bool,
+    /// The scopes that will be requested from the identity provider.
+    pub scopes: Vec<&'a str>,
     /// The MCP server being authorized.
     pub resource: &'a str,
     pub continue_url: &'a str,
@@ -119,7 +161,9 @@ fn truncate(value: &str) -> String {
 pub fn render(view: &ConsentView) -> String {
     let name = view
         .client_name
-        .map(|n| format!("<strong>{}</strong>", escape(&truncate(n))))
+        .map(sanitize_name)
+        .filter(|n| !n.is_empty())
+        .map(|n| format!("<strong>{}</strong>", escape(&truncate(&n))))
         .unwrap_or_else(|| "<strong>An unnamed application</strong>".to_string());
     let identity = match &view.client_host {
         Some(host) => format!(
@@ -134,8 +178,24 @@ pub fn render(view: &ConsentView) -> String {
              Only continue if you just started connecting an app on this device. If you did not, cancel.</div>",
             escape(&view.redirect_display)
         )
+    } else if view.insecure_http {
+        format!(
+            "<div class=\"warn\"><strong>Access will be sent over an unencrypted http connection \
+             ({}).</strong> Only continue if you trust this destination.</div>",
+            escape(&view.redirect_display)
+        )
     } else {
         String::new()
+    };
+    let permissions = if view.scopes.is_empty() {
+        String::new()
+    } else {
+        let items: String = view
+            .scopes
+            .iter()
+            .map(|scope| format!("<li><code>{}</code></li>", escape(&truncate(scope))))
+            .collect();
+        format!("<p>It is asking for these permissions:</p>\n<ul class=\"scopes\">{items}</ul>")
     };
 
     format!(
@@ -152,6 +212,7 @@ h1 {{ font-size: 1.25rem; margin: 0 0 1rem; }}
 .muted {{ color: #5c616b; font-size: .9rem; }}
 .dest {{ background: #f4f5f7; border-radius: 8px; padding: .75rem 1rem; word-break: break-all; }}
 .warn {{ background: #fff4e5; border: 1px solid #f0b357; border-radius: 8px; padding: .75rem 1rem; margin: 1rem 0; }}
+.scopes {{ margin: .25rem 0 1rem; padding-left: 1.25rem; }}
 .actions {{ display: flex; gap: .75rem; margin-top: 1.5rem; }}
 a.button {{ flex: 1; text-align: center; padding: .7rem 1rem; border-radius: 8px; text-decoration: none; font-weight: 600; }}
 a.primary {{ background: #0b5cad; color: #fff; }}
@@ -163,6 +224,7 @@ a.secondary {{ background: #e8eaee; color: #1d1f23; }}
 <h1>Authorize access</h1>
 <p>{name} wants to access <strong>{resource}</strong> on your behalf.</p>
 {identity}
+{permissions}
 <p>After you sign in, access will be sent to:</p>
 <p class="dest"><strong>{destination}</strong></p>
 {warning}
@@ -178,6 +240,7 @@ a.secondary {{ background: #e8eaee; color: #1d1f23; }}
         name = name,
         resource = escape(&truncate(view.resource)),
         identity = identity,
+        permissions = permissions,
         destination = escape(&view.redirect_display),
         warning = warning,
         cancel = escape(view.cancel_url),
@@ -194,11 +257,13 @@ mod tests {
             client_name: name,
             client_host: None,
             redirect_display: if loopback {
-                "127.0.0.1:5000".into()
+                "http://127.0.0.1:5000".into()
             } else {
-                "client.example".into()
+                "https://client.example".into()
             },
             loopback,
+            insecure_http: false,
+            scopes: vec!["mcp.read"],
             resource: "https://gw.example/mcp-server/mcp",
             continue_url: "https://idp.example/authorize?a=1&b=2",
             cancel_url: "https://client.example/cb?error=access_denied",
@@ -215,10 +280,36 @@ mod tests {
 
     #[test]
     fn warns_only_for_loopback() {
-        assert!(
-            render(&view(Some("App"), true)).contains("an app on this computer (127.0.0.1:5000)")
-        );
+        assert!(render(&view(Some("App"), true))
+            .contains("an app on this computer (http://127.0.0.1:5000)"));
         assert!(!render(&view(Some("App"), false)).contains("class=\"warn\""));
+    }
+
+    #[test]
+    fn shows_scopes_and_warns_on_plain_http() {
+        let html = render(&view(Some("App"), false));
+        assert!(html.contains("<li><code>mcp.read</code></li>"));
+        let mut no_scopes = view(Some("App"), false);
+        no_scopes.scopes = vec![];
+        assert!(!render(&no_scopes).contains("these permissions"));
+
+        let mut http = view(Some("App"), false);
+        http.redirect_display = "http://client.example".into();
+        http.insecure_http = true;
+        assert!(render(&http).contains("unencrypted http connection (http://client.example)"));
+        assert!(is_insecure_http("http://client.example/cb"));
+        assert!(!is_insecure_http("http://127.0.0.1:5000/cb"));
+        assert!(!is_insecure_http("https://client.example/cb"));
+    }
+
+    #[test]
+    fn strips_spoofing_characters_from_names() {
+        assert_eq!(sanitize_name("Clau\u{202E}edoc"), "Clauedoc");
+        assert_eq!(sanitize_name(" Good\u{200B}App\u{0007} "), "GoodApp");
+        assert_eq!(sanitize_name("\u{2066}\u{2069}"), "");
+        let html = render(&view(Some("\u{202E}evil"), false));
+        assert!(!html.contains('\u{202E}'));
+        assert!(render(&view(Some("\u{200B}"), false)).contains("An unnamed application"));
     }
 
     #[test]
@@ -267,21 +358,34 @@ mod tests {
         );
         assert_eq!(cookie_value(Some("__Host-mcp-auth-k2=v1"), &name), None);
         assert_eq!(cookie_value(None, &name), None);
+        assert_eq!(
+            clear_cookie(true, "k1"),
+            "__Host-mcp-auth-k1=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Secure"
+        );
+        assert_eq!(
+            clear_cookie(false, "k1"),
+            "mcp-auth-k1=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+        );
     }
 
     #[test]
     fn displays_destinations() {
         assert_eq!(
             redirect_display("http://127.0.0.1:5000/cb"),
-            "127.0.0.1:5000"
+            "http://127.0.0.1:5000"
         );
         assert_eq!(
             redirect_display("https://Client.Example/oauth/cb?x=1"),
-            "client.example"
+            "https://client.example"
         );
         assert_eq!(
             redirect_display("com.example.app:/callback"),
             "com.example.app: (an app on this device)"
+        );
+        // A private-use scheme's "host" is not a real host and must not be shown as one.
+        assert_eq!(
+            redirect_display("myapp://callback"),
+            "myapp: (an app on this device)"
         );
         assert_eq!(
             client_host("https://client.example/m.json"),

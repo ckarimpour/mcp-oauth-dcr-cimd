@@ -5,6 +5,7 @@
 
 use serde_json::Value;
 
+use crate::consent;
 use crate::oauth::ClientInfo;
 use crate::uri;
 
@@ -39,19 +40,17 @@ pub fn validate_client_id_url(client_id: &str) -> Result<CimdTarget, &'static st
     if parsed.has_userinfo {
         return Err("client_id URL must not contain credentials");
     }
-    let path = parsed
-        .path_and_query
-        .split_once('?')
-        .map(|(path, _)| path)
-        .unwrap_or(parsed.path_and_query);
+    // No query: each distinct query would be a distinct client_id and a distinct fetch,
+    // bypassing the document cache.
+    if parsed.path_and_query.contains('?') {
+        return Err("client_id URL must not contain a query string");
+    }
+    let path = parsed.path_and_query;
     if path.is_empty() || path == "/" {
         return Err("client_id URL must contain a path");
     }
-    if path
-        .split('/')
-        .any(|segment| segment == "." || segment == "..")
-    {
-        return Err("client_id URL must not contain dot segments");
+    if uri::has_path_traversal(client_id) {
+        return Err("client_id URL must not contain dot segments or encoded separators");
     }
     Ok(CimdTarget {
         origin: uri::normalize_origin(&parsed.scheme, parsed.authority),
@@ -94,7 +93,7 @@ pub fn parse_document(client_id: &str, body: &[u8]) -> Result<ClientInfo, &'stat
     let redirect_uris = redirect_uris
         .iter()
         .map(|value| match value.as_str() {
-            Some(uri) if uri::is_absolute_without_fragment(uri) => Ok(uri.to_string()),
+            Some(uri) if uri::is_safe_redirect_uri(uri) => Ok(uri.to_string()),
             _ => Err("client metadata document has an invalid redirect_uri"),
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -102,7 +101,7 @@ pub fn parse_document(client_id: &str, body: &[u8]) -> Result<ClientInfo, &'stat
     let name = document
         .get("client_name")
         .and_then(Value::as_str)
-        .map(str::trim)
+        .map(consent::sanitize_name)
         .filter(|name| !name.is_empty())
         .map(|name| name.chars().take(MAX_CLIENT_NAME_CHARS).collect());
 
@@ -122,10 +121,10 @@ mod tests {
     #[test]
     fn validates_client_id_urls() {
         assert_eq!(
-            validate_client_id_url("https://Client.Example:443/oauth/metadata.json?v=1").unwrap(),
+            validate_client_id_url("https://Client.Example:443/oauth/metadata.json").unwrap(),
             CimdTarget {
                 origin: "https://client.example".to_string(),
-                path_and_query: "/oauth/metadata.json?v=1".to_string(),
+                path_and_query: "/oauth/metadata.json".to_string(),
             }
         );
         for bad in [
@@ -136,6 +135,11 @@ mod tests {
             "https://user@client.example/m.json",
             "https://client.example/a/../m.json",
             "https://client.example/./m.json",
+            "https://client.example/a/%2e%2e/m.json",
+            "https://client.example/a/%2E/m.json",
+            "https://client.example/a%2fm.json",
+            "https://client.example/a\\m.json",
+            "https://client.example/m.json?v=1",
         ] {
             assert!(validate_client_id_url(bad).is_err(), "{}", bad);
         }
@@ -150,6 +154,20 @@ mod tests {
         assert_eq!(info.client_id, ID);
         assert_eq!(info.redirect_uris.len(), 2);
         assert_eq!(info.name.as_deref(), Some("Example"));
+
+        let spoofed = format!(
+            r#"{{"client_id":"{ID}","client_name":"Exa\u202emple","redirect_uris":["https://client.example/cb"]}}"#
+        );
+        assert_eq!(
+            parse_document(ID, spoofed.as_bytes())
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("Example")
+        );
+        let traversal =
+            format!(r#"{{"client_id":"{ID}","redirect_uris":["https://client.example/a/../cb"]}}"#);
+        assert!(parse_document(ID, traversal.as_bytes()).is_err());
     }
 
     #[test]

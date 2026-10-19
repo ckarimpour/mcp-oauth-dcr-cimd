@@ -32,6 +32,7 @@ fn config() -> String {
         "upstreamClientId": "upstream-client",
         "upstreamClientSecret": "upstream-secret",
         "upstreamClientAuthMethod": "client_secret_post",
+        "scopesSupported": ["mcp.read"],
         "signingSecret": "0123456789abcdef0123456789abcdef",
         "enableDcr": true,
         "enableCimd": false,
@@ -124,7 +125,10 @@ fn mcp_request_without_authorization_gets_401_challenge() {
 
     assert_eq!(response.status_code(), 401);
     let challenge = response.header("www-authenticate").unwrap();
-    assert_eq!(challenge, format!("Bearer resource_metadata=\"{PRM_URL}\""));
+    assert_eq!(
+        challenge,
+        format!("Bearer resource_metadata=\"{PRM_URL}\", scope=\"mcp.read\"")
+    );
     assert!(challenge.contains("resource_metadata"));
     assert_eq!(json_body(&response)["error"], "invalid_token");
     assert!(upstream.next().is_none());
@@ -196,7 +200,12 @@ fn upstream_401_gets_resource_metadata_added() {
     assert_eq!(response.status_code(), 401);
     assert_eq!(
         response.header("www-authenticate"),
-        Some(format!("Bearer error=\"invalid_token\", resource_metadata=\"{PRM_URL}\"").as_str())
+        Some(
+            format!(
+                "Bearer error=\"invalid_token\", resource_metadata=\"{PRM_URL}\", scope=\"mcp.read\""
+            )
+            .as_str()
+        )
     );
     assert_eq!(
         response.header("access-control-expose-headers"),
@@ -379,6 +388,45 @@ fn full_authorization_code_flow_with_mocked_idp() {
     assert!(
         mcp_upstream.next().is_none(),
         "no OAuth endpoint may reach the MCP upstream"
+    );
+}
+
+#[test]
+fn wrong_pkce_verifier_is_rejected_without_calling_the_idp() {
+    let calls = Rc::new(RefCell::new(0u32));
+    let seen = Rc::clone(&calls);
+    let mut tester = UnitTestBuilder::default()
+        .with_config(config())
+        .with_http_upstream_from_authority(IDP_AUTHORITY, move |_req: UnitHttpRequest| {
+            *seen.borrow_mut() += 1;
+            UnitHttpResponse::new(200).with_body("{}")
+        })
+        .with_entrypoint(crate::configure);
+    let client_id = register(&mut tester);
+    let wrapped_code = walk_to_wrapped_code(&mut tester, &client_id);
+
+    let response = tester.request(
+        UnitHttpRequest::post()
+            .with_path(format!("{BASE}/oauth/token"))
+            .with_header("content-type", "application/x-www-form-urlencoded")
+            .with_body(form(&[
+                ("grant_type", "authorization_code"),
+                ("code", &wrapped_code),
+                ("redirect_uri", REDIRECT_URI),
+                (
+                    "code_verifier",
+                    "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXX",
+                ),
+                ("client_id", &client_id),
+            ])),
+    );
+
+    assert_eq!(response.status_code(), 400);
+    assert_eq!(json_body(&response)["error"], "invalid_grant");
+    assert_eq!(
+        *calls.borrow(),
+        0,
+        "a wrong verifier must not reach the IdP"
     );
 }
 

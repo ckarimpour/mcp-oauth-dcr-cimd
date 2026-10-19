@@ -102,6 +102,76 @@ pub fn is_absolute_without_fragment(value: &str) -> bool {
     }
 }
 
+/// Path of a URI without its query: after `scheme://authority` for hierarchical URIs, or after
+/// `scheme:` for others such as `com.example.app:/callback`.
+fn path_of(value: &str) -> &str {
+    let path = match parse(value) {
+        Some(parsed) => parsed.path_and_query,
+        None => value.split_once(':').map(|(_, rest)| rest).unwrap_or(""),
+    };
+    path.split_once('?').map(|(path, _)| path).unwrap_or(path)
+}
+
+/// Path-traversal markers in the path: `.` or `..` segments, their percent-encoded forms, encoded
+/// slashes or backslashes, and any literal backslash. Rejected in redirect URIs and CIMD URLs so a
+/// prefix or path check can't be escaped by a later normalization step.
+pub fn has_path_traversal(value: &str) -> bool {
+    if value.contains('\\') {
+        return true;
+    }
+    let path = path_of(value);
+    let lower = path.to_ascii_lowercase();
+    lower.contains("%2e")
+        || lower.contains("%2f")
+        || lower.contains("%5c")
+        || path
+            .split('/')
+            .any(|segment| segment == "." || segment == "..")
+}
+
+/// A redirect URI that is safe to register or redirect to: absolute, no fragment, no control
+/// characters, no script-capable scheme and no path traversal.
+pub fn is_safe_redirect_uri(value: &str) -> bool {
+    is_absolute_without_fragment(value) && !has_path_traversal(value)
+}
+
+/// Whether an allow-list prefix entry is well formed: an `http(s)` URL with a host, no
+/// credentials, query or fragment, and a path that ends in `/`. Rules out entries such as a bare
+/// `https://` that would match every redirect URI.
+pub fn is_valid_prefix_entry(prefix: &str) -> bool {
+    if !is_safe_redirect_uri(prefix) {
+        return false;
+    }
+    match parse(prefix) {
+        Some(parsed) => {
+            (parsed.scheme == "https" || parsed.scheme == "http")
+                && !parsed.has_userinfo
+                && parsed.path_and_query.starts_with('/')
+                && parsed.path_and_query.ends_with('/')
+                && !parsed.path_and_query.contains('?')
+        }
+        None => false,
+    }
+}
+
+/// Whether `candidate` falls under an allow-list prefix entry: the same scheme and authority, and
+/// a path that starts with the prefix's path. Compared on parsed parts, never as raw strings, and
+/// only for candidates without path traversal.
+pub fn matches_prefix(prefix: &str, candidate: &str) -> bool {
+    if !is_safe_redirect_uri(candidate) {
+        return false;
+    }
+    match (parse(prefix), parse(candidate)) {
+        (Some(p), Some(c)) => {
+            p.scheme == c.scheme
+                && !c.has_userinfo
+                && p.authority.eq_ignore_ascii_case(c.authority)
+                && c.path_and_query.starts_with(p.path_and_query)
+        }
+        _ => false,
+    }
+}
+
 /// `http://127.0.0.1`, `http://[::1]` or `http://localhost`, any port, no userinfo.
 pub fn is_loopback_http(value: &str) -> bool {
     if has_unsafe_chars(value) {
@@ -121,7 +191,7 @@ pub fn is_loopback_http(value: &str) -> bool {
 /// Whether a redirect URI presented at /authorize matches a registered one. Exact match, except
 /// that loopback redirect URIs match on any port (RFC 8252 section 7.3).
 pub fn redirect_matches(registered: &str, presented: &str) -> bool {
-    if has_unsafe_chars(registered) || has_unsafe_chars(presented) {
+    if !is_safe_redirect_uri(registered) || !is_safe_redirect_uri(presented) {
         return false;
     }
     if registered == presented {
@@ -287,6 +357,71 @@ mod tests {
             "https://a.example/cb\r\nX-Injected: 1"
         ));
         assert!(!is_absolute_without_fragment("https://a.example/c b"));
+    }
+
+    #[test]
+    fn detects_path_traversal() {
+        for bad in [
+            "https://a.example/cb/../evil",
+            "https://a.example/cb/./x",
+            "https://a.example/cb/%2e%2e/evil",
+            "https://a.example/cb/%2E%2e/evil",
+            "https://a.example/cb/.%2e/evil",
+            "https://a.example/cb%2f..%2fevil",
+            "https://a.example/cb\\evil",
+            "com.example.app:/cb/../x",
+        ] {
+            assert!(has_path_traversal(bad), "{}", bad);
+            assert!(!is_safe_redirect_uri(bad), "{}", bad);
+        }
+        for good in [
+            "https://a.example/cb",
+            "https://a.example/cb?next=%2Fhome",
+            "https://a.example/v1.2/cb",
+            "com.example.app:/callback",
+        ] {
+            assert!(!has_path_traversal(good), "{}", good);
+            assert!(is_safe_redirect_uri(good), "{}", good);
+        }
+    }
+
+    #[test]
+    fn validates_prefix_entries() {
+        assert!(is_valid_prefix_entry("https://client.example/oauth/"));
+        assert!(is_valid_prefix_entry("https://client.example/"));
+        for bad in [
+            "https://",
+            "https:///",
+            "https://client.example",
+            "https://client.example/oauth",
+            "https://user@client.example/oauth/",
+            "https://client.example/oauth/?x=1/",
+            "https://client.example/a/../",
+            "myapp://callback/",
+        ] {
+            assert!(!is_valid_prefix_entry(bad), "{}", bad);
+        }
+    }
+
+    #[test]
+    fn matches_prefixes_on_parsed_parts() {
+        let prefix = "https://client.example/oauth/";
+        assert!(matches_prefix(prefix, "https://client.example/oauth/cb"));
+        assert!(matches_prefix(
+            prefix,
+            "https://CLIENT.example/oauth/cb?x=1"
+        ));
+        for bad in [
+            "https://client.example/oauth/../redirect?to=evil",
+            "https://client.example/oauth/%2e%2e/redirect",
+            "https://client.example/oauthx/cb",
+            "https://client.example.evil/oauth/cb",
+            "https://client.example:8443/oauth/cb",
+            "http://client.example/oauth/cb",
+            "https://evil@client.example/oauth/cb",
+        ] {
+            assert!(!matches_prefix(prefix, bad), "{}", bad);
+        }
     }
 
     #[test]
