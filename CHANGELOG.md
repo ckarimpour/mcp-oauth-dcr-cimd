@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.0.1 — 2026-10-21
+
+### Fixed
+
+- **MCP SDK clients (Claude Code) can discover the authorization server behind a base path.**
+  When the gateway serves only the issuer's base path, `B/.well-known/openid-configuration` is the
+  one discovery URL those clients reach, and they validate it as OIDC provider metadata. v1.0.0
+  omitted the OIDC-required fields, so discovery failed ("jwks_uri: expected string") and the
+  client fell back to a non-existent registration URL. The metadata now includes `jwks_uri`
+  (`B/oauth/jwks`, which serves an empty JWK set), `subject_types_supported: ["public"]` and
+  `id_token_signing_alg_values_supported: ["RS256"]`. The gateway still issues no tokens and
+  relays no ID token. Found while testing with Entra ID and Claude Code.
+
 ## v1.0.0 — 2026-10-19
 
 First tagged release, addressing P4A catalog review round 1 (commit `ab6d5ea`).

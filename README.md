@@ -27,15 +27,15 @@ MCP client ──(2) MCP calls with IdP access token──▶ Gateway ──JWT 
   `upstreamScope`. The consent page lists them.
 - Access tokens are the IdP's own tokens. A standard **JWT Validation** (or OAuth 2.0 Token
   Introspection) policy validates them on MCP calls.
-- **Stateless.** Client IDs, `state`, codes and refresh tokens are HMAC-signed values. It works
-  on any number of replicas with no Redis and no extra app to host.
+- **Stateless.** Client IDs and `state` are HMAC-signed values; codes and refresh tokens are
+  encrypted. It works on any number of replicas with no Redis and no extra app to host.
 
 The full behaviour is in [docs/spec.md](docs/spec.md).
 
 ## Status
 
 Builds against PDK 1.10.0 with Rust 1.99.1:
-- all 80 tests pass (`cargo test`): 65 logic tests plus 15 `pdk-unit` tests that run the real
+- all 81 tests pass (`cargo test`): 65 logic tests plus 16 `pdk-unit` tests that run the real
   filters in-process;
 - `cargo clippy` is clean for host and `wasm32-wasip1`, and `cargo fmt --check` passes;
 - `cargo build --release --target wasm32-wasip1` produces a ~1 MB module that imports only
@@ -50,12 +50,19 @@ Inspector completed discovery → DCR → consent page → Okta → callback →
 `tools/list` with the Okta access token (`aud=api://default`, scopes `offline_access mcp.read`).
 MCP Support passes `/.well-known/*` and `/oauth/*` through to this policy.
 
+**Verified live with Entra ID (2026-10-21):** v1.0.1 on the same gateway (`mcp` instance at
+`/mcp-entra`: MCP Support → this policy), with Microsoft Entra ID as the IdP. Claude Code, from a
+clean profile, registered with **CIMD** (`https://claude.ai/oauth/claude-code-client-metadata`,
+trusted via `cimdTrustedHosts`), showed the consent page, signed in with Entra, and ran
+`tools/list` and `tools/call`. Live negative checks were refused: an unregistered redirect URI,
+an untrusted CIMD host, and CIMD URLs with a query, dot segments or `http`.
+
 **Known gap:** the built-in JWT Validation policy (1.4.1 and the Flex 0.12.0 line) has no
 implementation for `mcp` instances, so nothing on that instance validates access tokens yet. On a
 real MCP server, add token validation before production use.
 
-Still to do: a CIMD client test, the refresh-token flow, real clients (Claude, VS Code), and the
-P4A submission (public repo).
+Still to do: gateway-side token validation (planned for 1.1.0), the refresh-token flow, Codex
+and VS Code, and a load/HA test. See [docs/product-review.md](docs/product-review.md).
 
 ## Endpoints
 
@@ -65,6 +72,7 @@ P4A submission (public repo).
 |---|---|
 | `GET B/.well-known/oauth-protected-resource` (also `…/oauth-protected-resource/mcp`) | Protected-resource metadata |
 | `GET B/.well-known/openid-configuration`, `GET B/.well-known/oauth-authorization-server` | Authorization-server metadata |
+| `GET B/oauth/jwks` | Empty JWK set: the gateway signs no tokens |
 | `POST B/oauth/register` | DCR |
 | `GET B/oauth/authorize` | Validates the client, shows the gateway consent page, then continues to the IdP |
 | `GET B/oauth/callback` | The IdP returns here; the gateway redirects to the MCP client |
@@ -72,7 +80,8 @@ P4A submission (public repo).
 | Any other request without `Authorization` | 401 + `WWW-Authenticate: Bearer resource_metadata="…"` |
 
 MCP clients discover the authorization server from `resource_metadata` in the 401. For an issuer
-with a path, they then try `B/.well-known/openid-configuration`, which this policy serves. The
+with a path, they then try `B/.well-known/openid-configuration`, which this policy serves as
+valid OIDC provider metadata (MCP SDK clients such as Claude Code require that). The
 root-level path-insertion forms (`/.well-known/oauth-authorization-server/B`) only reach this
 policy if the API is mounted at `/`. If a client insists on those forms, publish the MCP server
 on its own hostname at `/`.

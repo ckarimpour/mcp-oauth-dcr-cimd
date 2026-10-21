@@ -51,6 +51,7 @@ string and any trailing `/`.
 | `OPTIONS` on a metadata, register or token path | 204 CORS preflight |
 | `GET B/.well-known/oauth-protected-resource[B-relative MCP path]` | RFC 9728 metadata |
 | `GET B/.well-known/oauth-authorization-server`, `GET B/.well-known/openid-configuration` | RFC 8414 metadata |
+| `GET B/oauth/jwks` | empty JWK set (`{"keys":[]}`) |
 | `POST B/oauth/register` | DCR (if enabled) |
 | `GET B/oauth/authorize` | validate client, consent page (or 302 to IdP) |
 | `GET B/oauth/callback` | 302 back to the MCP client |
@@ -61,10 +62,14 @@ string and any trailing `/`.
 Root-level path-insertion forms (`/.well-known/oauth-authorization-server` + `B`, etc.) are also
 answered, so the same policy works when applied to an API mounted at `/`.
 
-`B/.well-known/openid-configuration` serves the same RFC 8414 OAuth document, as a discovery alias
-for MCP clients that try the OIDC path. This server is not an OpenID provider: the document omits
-`jwks_uri`, `subject_types_supported` and `id_token_signing_alg_values_supported`, and no ID token
-is ever returned (see Token).
+`B/.well-known/openid-configuration` serves the same document, as a discovery alias for MCP
+clients that try the OIDC path. When the gateway serves only `B`, it is the one discovery URL those
+clients can reach, and MCP SDK clients (Claude Code among them) validate it as OIDC provider
+metadata. So the document also carries the three OIDC-required fields: `jwks_uri`
+(`B/oauth/jwks`, an empty JWK set), `subject_types_supported: ["public"]` and
+`id_token_signing_alg_values_supported: ["RS256"]` (OIDC Discovery requires RS256). This server
+still issues no tokens of its own: access tokens are the IdP's, and no ID token is ever returned
+(see Token).
 
 ### Response flow
 

@@ -109,6 +109,35 @@ fn protected_resource_metadata_is_answered_by_the_policy() {
     );
 }
 
+/// Behind a base path, MCP SDK clients reach the metadata at `{base}/.well-known/openid-configuration`
+/// and validate it as OIDC provider metadata.
+#[test]
+fn openid_configuration_is_valid_oidc_metadata_with_an_empty_jwk_set() {
+    let upstream = Rc::new(TraceBackend::new(UnitHttpResponse::new(200)));
+    let mut tester = tester_with_upstream(Rc::clone(&upstream));
+
+    let response = tester.request(
+        UnitHttpRequest::get().with_path(format!("{BASE}/.well-known/openid-configuration")),
+    );
+    assert_eq!(response.status_code(), 200);
+    let body = json_body(&response);
+    assert_eq!(body["issuer"], "https://gw.example/mcp-server");
+    assert_eq!(body["jwks_uri"], "https://gw.example/mcp-server/oauth/jwks");
+    assert_eq!(body["subject_types_supported"], json!(["public"]));
+    assert_eq!(
+        body["id_token_signing_alg_values_supported"],
+        json!(["RS256"])
+    );
+
+    let response = tester.request(UnitHttpRequest::get().with_path(format!("{BASE}/oauth/jwks")));
+    assert_eq!(response.status_code(), 200);
+    assert_eq!(json_body(&response), json!({ "keys": [] }));
+    assert!(
+        upstream.next().is_none(),
+        "discovery must not reach the MCP upstream"
+    );
+}
+
 // ---- 3: unauthenticated MCP request is challenged ---------------------------------------
 
 #[test]

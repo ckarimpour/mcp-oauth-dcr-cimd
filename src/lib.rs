@@ -120,6 +120,7 @@ async fn request_filter(
             200,
             &oauth::authorization_server_metadata(oauth),
         )),
+        Route::Jwks => Flow::Break(json_response(200, &oauth::jwks())),
         Route::Authorize => Flow::Break(authorize(&path, settings, cache, &client).await),
         Route::Callback => {
             let cookie = headers_state.handler().header(COOKIE_HEADER);

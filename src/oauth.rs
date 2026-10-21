@@ -18,6 +18,7 @@ use crate::uri::{self, Params};
 const WELL_KNOWN_PRM: &str = "/.well-known/oauth-protected-resource";
 const WELL_KNOWN_AS: &str = "/.well-known/oauth-authorization-server";
 const WELL_KNOWN_OIDC: &str = "/.well-known/openid-configuration";
+const JWKS_PATH: &str = "/oauth/jwks";
 
 const STATE_TTL_SECS: u64 = 600;
 const CODE_TTL_SECS: u64 = 300;
@@ -127,6 +128,8 @@ pub struct OAuthSettings {
     pub authorization_endpoint: String,
     pub token_endpoint: String,
     pub registration_endpoint: String,
+    /// Serves an empty JWK set: the facade signs no tokens.
+    pub jwks_uri: String,
     pub callback_url: String,
     pub routes: Routes,
     pub upstream_authorize_url: String,
@@ -409,6 +412,7 @@ impl OAuthSettings {
             authorization_endpoint: format!("{issuer}/oauth/authorize"),
             token_endpoint: format!("{issuer}/oauth/token"),
             registration_endpoint: format!("{issuer}/oauth/register"),
+            jwks_uri: format!("{issuer}{JWKS_PATH}"),
             callback_url: format!("{issuer}/oauth/callback"),
             routes: Routes::new(&base_path, &mcp_path),
             issuer,
@@ -446,6 +450,7 @@ impl OAuthSettings {
 pub enum Route {
     ProtectedResourceMetadata,
     AuthorizationServerMetadata,
+    Jwks,
     Register,
     Authorize,
     Callback,
@@ -459,6 +464,7 @@ pub enum Route {
 pub struct Routes {
     prm: Vec<String>,
     asm: Vec<String>,
+    jwks: String,
     register: String,
     authorize: String,
     callback: String,
@@ -484,6 +490,7 @@ impl Routes {
         Self {
             prm,
             asm,
+            jwks: format!("{base}{JWKS_PATH}"),
             register: format!("{base}/oauth/register"),
             authorize: format!("{base}/oauth/authorize"),
             callback: format!("{base}/oauth/callback"),
@@ -497,6 +504,8 @@ impl Routes {
             (Route::ProtectedResourceMetadata, "GET", "GET, OPTIONS")
         } else if self.asm.iter().any(|p| p == path) {
             (Route::AuthorizationServerMetadata, "GET", "GET, OPTIONS")
+        } else if path == self.jwks {
+            (Route::Jwks, "GET", "GET, OPTIONS")
         } else if path == self.register {
             (Route::Register, "POST", "POST, OPTIONS")
         } else if path == self.authorize {
@@ -671,11 +680,19 @@ pub fn protected_resource_metadata(o: &OAuthSettings) -> Value {
     metadata
 }
 
+/// Served at both the RFC 8414 and the OpenID Connect discovery paths. Clients that reach it through
+/// `openid-configuration` (the only path-appended form, used when the gateway serves just the
+/// issuer's base path) validate it as OIDC provider metadata, which requires `jwks_uri`,
+/// `subject_types_supported` and `id_token_signing_alg_values_supported`. The facade issues no ID
+/// tokens, so the JWK set is empty; RS256 is listed because OIDC Discovery requires it.
 pub fn authorization_server_metadata(o: &OAuthSettings) -> Value {
     let mut metadata = json!({
         "issuer": o.issuer,
         "authorization_endpoint": o.authorization_endpoint,
         "token_endpoint": o.token_endpoint,
+        "jwks_uri": o.jwks_uri,
+        "subject_types_supported": ["public"],
+        "id_token_signing_alg_values_supported": ["RS256"],
         "response_types_supported": ["code"],
         "grant_types_supported": GRANT_TYPES,
         "token_endpoint_auth_methods_supported": ["none"],
@@ -690,6 +707,12 @@ pub fn authorization_server_metadata(o: &OAuthSettings) -> Value {
         metadata["scopes_supported"] = json!(o.scopes_supported);
     }
     metadata
+}
+
+/// The JWK set at `jwks_uri`: empty, because the facade signs no tokens (access tokens are the
+/// IdP's own and ID tokens are not relayed).
+pub fn jwks() -> Value {
+    json!({ "keys": [] })
 }
 
 /// `WWW-Authenticate` value with `resource_metadata` (and `scope`, when known and not already
@@ -1675,6 +1698,7 @@ mod tests {
             routes.route("GET", "/.well-known/oauth-authorization-server/mcp-server"),
             Route::AuthorizationServerMetadata
         );
+        assert_eq!(routes.route("GET", &format!("{b}/oauth/jwks")), Route::Jwks);
         assert_eq!(
             routes.route("POST", &format!("{b}/oauth/register")),
             Route::Register
@@ -1720,6 +1744,11 @@ mod tests {
         );
         assert_eq!(asm["client_id_metadata_document_supported"], true);
         assert_eq!(asm["code_challenge_methods_supported"][0], "S256");
+        // Required when the document is read as OIDC provider metadata (openid-configuration).
+        assert_eq!(asm["jwks_uri"], "https://gw.example/mcp-server/oauth/jwks");
+        assert_eq!(asm["subject_types_supported"][0], "public");
+        assert_eq!(asm["id_token_signing_alg_values_supported"][0], "RS256");
+        assert_eq!(jwks(), json!({ "keys": [] }));
 
         let mut no_dcr = input();
         no_dcr.enable_dcr = false;
